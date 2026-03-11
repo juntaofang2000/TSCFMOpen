@@ -800,17 +800,77 @@ class Trainer(_BaseTrainer):
         with self.amp_ctx:
             logits = self.model(micro_X, y_train, None)  # (B, Ttest, C)
             B, Ttest, C = logits.shape
-            pred = logits.reshape(-1, C)
-            true = y_test.reshape(-1).long()
 
-            valid = (true >= 0) & (true < C)
+            # Flatten + valid-filter (must match accuracy branch semantics).
+            logits_acc = logits.reshape(-1, C)
+            true_acc = y_test.reshape(-1).long()
+            valid = (true_acc >= 0) & (true_acc < C)
             if not torch.all(valid):
-                true = true[valid]
-                pred = pred[valid]
-            if true.numel() == 0:
+                logits_acc = logits_acc[valid]
+                true_acc = true_acc[valid]
+            if true_acc.numel() == 0:
                 return {"ce": 0.0, "accuracy": 0.0}
 
-            loss = F.cross_entropy(pred, true)
+            # Active classes come from the context (y_train).
+            active_idx = torch.unique(y_train).sort().values.long()
+            active_idx = active_idx[(active_idx >= 0) & (active_idx < C)]
+            K = int(active_idx.numel())
+            if K == 0:
+                raise ValueError(
+                    f"Empty active classes (K=0) after filtering to [0, C). "
+                    f"C={C}, step={int(self.curr_step) + 1}, train_size={train_size}."
+                )
+
+            logits_active = logits_acc.index_select(dim=-1, index=active_idx)
+            if active_idx.min().item() == 0 and active_idx.max().item() == K - 1:
+                true_active = true_acc
+            else:
+                mapper = torch.full((C,), -1, dtype=torch.long, device=active_idx.device)
+                mapper[active_idx] = torch.arange(K, device=active_idx.device)
+                true_active = mapper[true_acc]
+
+                # Default behavior (方案A): fail fast if any query label is missing in context.
+                if not torch.all(true_active >= 0):
+                    missing_labels = torch.unique(true_acc[true_active < 0]).detach().cpu().tolist()
+                    active_labels = active_idx.detach().cpu().tolist()
+                    step_idx = int(self.curr_step) + 1
+                    if self.master_process:
+                        print(
+                            "[active-loss] Found query labels not in active_idx; episode may be malformed. "
+                            f"step={step_idx} train_size={train_size} C={C} K={K}",
+                            flush=True,
+                        )
+                        print(f"  active_idx: {active_labels}", flush=True)
+                        print(f"  missing_labels: {missing_labels}", flush=True)
+                        try:
+                            diff = sorted(set(missing_labels) - set(active_labels))
+                            print(f"  missing_labels \\ active_idx: {diff}", flush=True)
+                        except Exception:
+                            pass
+                    raise ValueError(
+                        "Query labels not present in context active classes. "
+                        f"missing_labels={missing_labels}, active_idx={active_labels}, "
+                        f"step={step_idx}, train_size={train_size}"
+                    )
+
+            # Debug log (DDP-safe): gate prints to master + periodic steps.
+            debug_every = int(getattr(self.config, "debug_active_loss_every", 100))
+            step_idx = int(self.curr_step) + 1
+            if self.master_process and debug_every > 0 and (step_idx % debug_every == 0):
+                ta_min = int(true_active.min().item()) if true_active.numel() else None
+                ta_max = int(true_active.max().item()) if true_active.numel() else None
+                active_list = active_idx.detach().cpu().tolist()
+                if len(active_list) > 64:
+                    active_list = active_list[:64] + ["..."]
+                print(
+                    "[active-loss] "
+                    f"step={step_idx} K={K} active_idx={active_list} "
+                    f"logits_active={tuple(logits_active.shape)} true_active_min/max={ta_min}/{ta_max}",
+                    flush=True,
+                )
+
+            # Loss aligned to active classes (context K classes).
+            loss = F.cross_entropy(logits_active, true_active)
 
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite loss")
@@ -821,39 +881,7 @@ class Trainer(_BaseTrainer):
         if micro_batch_idx == num_micro_batches - 1:
             self._debug_log_missing_grads()
 
-        # Active-class accuracy (query logits sliced to active classes)
-        logits_acc = logits.reshape(-1, C)
-        true_acc = y_test.reshape(-1).long()
-        valid_acc = (true_acc >= 0) & (true_acc < C)
-        if valid_acc.any():
-            logits_acc = logits_acc[valid_acc]
-            true_acc = true_acc[valid_acc]
-        else:
-            logits_acc = logits_acc[:0]
-            true_acc = true_acc[:0]
-
-        active_idx = torch.unique(y_train).sort().values.long()
-        K = int(active_idx.numel())
-        if K > 0 and logits_acc.numel() > 0:
-            logits_active = logits_acc.index_select(dim=-1, index=active_idx)
-            if active_idx.numel() == K and active_idx.min().item() == 0 and active_idx.max().item() == K - 1:
-                true_active = true_acc
-                valid_active = torch.ones_like(true_active, dtype=torch.bool)
-            else:
-                mapper = torch.full((C,), -1, dtype=torch.long, device=active_idx.device)
-                mapper[active_idx] = torch.arange(K, device=active_idx.device)
-                true_active = mapper[true_acc]
-                valid_active = true_active >= 0
-            if valid_active.any():
-                logits_active = logits_active[valid_active]
-                true_active = true_active[valid_active]
-            else:
-                logits_active = logits_active[:0]
-                true_active = true_active[:0]
-        else:
-            logits_active = logits_acc
-            true_active = true_acc
-
+        # Accuracy: reuse the exact same active-class tensors as the loss.
         with torch.no_grad():
             if logits_active.numel() > 0 and true_active.numel() > 0:
                 acc_val = (logits_active.argmax(dim=1) == true_active).float().mean().item()
