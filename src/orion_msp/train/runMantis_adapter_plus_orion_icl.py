@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -129,6 +130,27 @@ def _extend_parser(parser):
             "Print trainable parameter names with grad=None after the last micro-batch backward of each step. "
             "Useful to identify parameters that will trigger DDP reduction errors."
         ),
+    )
+
+    # Overfit-one-episode debug mode
+    parser.add_argument(
+        "--overfit_one_episode",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Debug mode: cache one episode and train on it for N steps.",
+    )
+    parser.add_argument("--overfit_steps", type=int, default=300, help="Number of optimizer steps in overfit mode.")
+    parser.add_argument(
+        "--overfit_seed",
+        type=int,
+        default=1234,
+        help="Seed used to generate the cached episode (rank0 generates then broadcasts under DDP).",
+    )
+    parser.add_argument(
+        "--overfit_freeze_prior",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="If true, do not call the prior again after caching the first episode.",
     )
 
     parser.add_argument(
@@ -590,6 +612,384 @@ class Trainer(_BaseTrainer):
             f"  - {shown}{suffix}"
         )
 
+    @staticmethod
+    def _set_global_seed(seed: int) -> None:
+        try:
+            import numpy as _np
+
+            _np.random.seed(int(seed))
+        except Exception:
+            pass
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+    def _broadcast_cached_batch(self, batch_tensors: list[Tensor]) -> list[Tensor]:
+        """DDP: broadcast a list of tensors from rank0 to all ranks.
+
+        Uses one broadcast_object_list for metadata, then dist.broadcast per tensor.
+        """
+        if not self.ddp:
+            return batch_tensors
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return batch_tensors
+
+        rank = int(getattr(self, "ddp_rank", 0))
+        device = torch.device(self.config.device)
+
+        meta: list[dict] | None
+        if rank == 0:
+            meta = [
+                {
+                    "shape": tuple(t.shape),
+                    "dtype": str(t.dtype),
+                    "requires_grad": bool(t.requires_grad),
+                }
+                for t in batch_tensors
+            ]
+        else:
+            meta = None
+
+        obj_list = [meta]
+        torch.distributed.broadcast_object_list(obj_list, src=0)
+        meta = obj_list[0]
+        assert isinstance(meta, list) and all(isinstance(m, dict) for m in meta), "Invalid broadcast meta"
+
+        # Map dtype string back to torch.dtype
+        str_to_dtype = {
+            "torch.float16": torch.float16,
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float32": torch.float32,
+            "torch.float64": torch.float64,
+            "torch.int8": torch.int8,
+            "torch.uint8": torch.uint8,
+            "torch.int16": torch.int16,
+            "torch.int32": torch.int32,
+            "torch.int64": torch.int64,
+            "torch.bool": torch.bool,
+        }
+
+        out: list[Tensor] = []
+        for i, m in enumerate(meta):
+            shape = tuple(m["shape"])
+            dtype = str_to_dtype.get(str(m["dtype"]), None)
+            if dtype is None:
+                raise ValueError(f"Unsupported dtype in broadcast meta: {m['dtype']}")
+
+            if rank == 0:
+                t = batch_tensors[i].to(device=device)
+            else:
+                t = torch.empty(shape, dtype=dtype, device=device)
+
+            torch.distributed.broadcast(t, src=0)
+            out.append(t)
+
+        return out
+
+    def make_cached_episode(self, seed: int) -> list[Tensor]:
+        """Generate one episode batch and cache it (prefer GPU) for overfit debugging."""
+        # DDP: only rank0 generates; others receive via broadcast.
+        if self.ddp and torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = int(getattr(self, "ddp_rank", 0))
+            if rank != 0:
+                return self._broadcast_cached_batch([])
+
+        # Force deterministic episode generation as much as possible.
+        self._set_global_seed(int(seed))
+
+        # Try to also pin CaukerICLPrior seed/cursor if present.
+        ds = getattr(self.dataloader, "dataset", None)
+        if ds is not None:
+            try:
+                if hasattr(ds, "icl_base_seed"):
+                    ds.icl_base_seed = int(seed)
+                if hasattr(ds, "_task_cursor"):
+                    ds._task_cursor = 0
+            except Exception:
+                pass
+
+        iterator = iter(self.dataloader)
+        batch = next(iterator)
+        # Normalize nested tensors to padded tensors (same as base run_batch).
+        batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+        # Move to training device once to avoid per-step H2D copies.
+        device = torch.device(self.config.device)
+        batch_dev = [t.to(device=device, non_blocking=True) for t in batch]
+
+        # DDP: ensure all ranks share the exact same cached episode.
+        batch_dev = self._broadcast_cached_batch(batch_dev)
+        return batch_dev
+
+    @staticmethod
+    def _grad_norm_from_params(params: list[Tensor]) -> float:
+        sq_sum = None
+        for p in params:
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            # ensure float for stable accumulation
+            if not torch.is_floating_point(g):
+                continue
+            v = g.float().pow(2).sum()
+            sq_sum = v if sq_sum is None else (sq_sum + v)
+        if sq_sum is None:
+            return 0.0
+        return float(torch.sqrt(sq_sum).item())
+
+    def _pick_param_to_track(self) -> tuple[str, Tensor] | None:
+        # Prefer a parameter in the ICL predictor, otherwise first trainable param.
+        candidates: list[tuple[str, Tensor]] = []
+        for name, p in self.raw_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim < 2:
+                continue
+            candidates.append((name, p))
+        if not candidates:
+            return None
+
+        for name, p in candidates:
+            if "icl_predictor" in name:
+                return name, p
+        return candidates[0]
+
+    def train_step_on_batch(self, batch: list[Tensor]) -> dict[str, float]:
+        """One optimizer step on a provided batch. Returns metrics for debugging."""
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # Ensure non-nested, and keep everything on device.
+        batch = [t.to_padded_tensor(padding=0.0) if t.is_nested else t for t in batch]
+
+        # Split into micro-batches (same logic as base Trainer.run_batch).
+        splits = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
+        all_micros = list(zip(*splits))
+
+        valid_micros = []
+        for mb in all_micros:
+            _, _, _, micro_seq_len, micro_train_size = mb
+            seq_len, train_size = self.validate_micro_batch(micro_seq_len, micro_train_size)
+            if seq_len > train_size:
+                valid_micros.append(mb)
+
+        num_micro_batches = len(valid_micros)
+        if num_micro_batches == 0:
+            self.scheduler.step()
+            return {
+                "ce": 0.0,
+                "accuracy": 0.0,
+                "grad_norm": 0.0,
+                "grad_norm_encoder": 0.0,
+                "grad_norm_adapter": 0.0,
+                "grad_norm_icl": 0.0,
+                "lr": float(self.scheduler.get_last_lr()[0]),
+            }
+
+        results = {"ce": 0.0, "accuracy": 0.0}
+        failed = 0
+        for i, micro in enumerate(valid_micros):
+            try:
+                res = self.run_micro_batch(micro, i, num_micro_batches)
+                for k, v in res.items():
+                    results[k] = results.get(k, 0.0) + float(v)
+            except torch.cuda.OutOfMemoryError:
+                if self.master_process:
+                    print(f"[overfit] OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
+                torch.cuda.empty_cache()
+                failed += 1
+                continue
+            except FloatingPointError:
+                if self.master_process:
+                    print(f"[overfit] Non-finite loss in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
+                failed += 1
+                continue
+
+        if failed / max(1, len(valid_micros)) > 0.1:
+            raise RuntimeError("Too many failed micro-batches in overfit mode.")
+
+        # Unscale grads before measuring/optional clipping.
+        if bool(getattr(self, "amp", False)):
+            try:
+                self.scaler.unscale_(self.optimizer)
+            except Exception:
+                pass
+
+        # Grad norms: total + key modules.
+        total_gn = self._grad_norm_from_params([p for p in self.raw_model.parameters() if p.requires_grad])
+        enc = getattr(self.raw_model, "mantis_model", None)
+        adapter = getattr(self.raw_model, "adapter", None)
+        icl = getattr(self.raw_model, "icl_predictor", None)
+        gn_enc = self._grad_norm_from_params([p for p in enc.parameters() if p.requires_grad]) if enc is not None else 0.0
+        gn_adp = self._grad_norm_from_params([p for p in adapter.parameters() if p.requires_grad]) if adapter is not None else 0.0
+        gn_icl = self._grad_norm_from_params([p for p in icl.parameters() if p.requires_grad]) if icl is not None else 0.0
+
+        # Optional clipping (mirror base logic).
+        if self.config.gradient_clipping > 0:
+            total_norm_clip = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+            if not torch.isfinite(total_norm_clip):
+                if self.master_process:
+                    print(f"[overfit] Non-finite grad norm at step {self.curr_step}; skipping optimizer step.")
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.update()
+                self.scheduler.step()
+                results.update(
+                    {
+                        "grad_norm": float(total_gn),
+                        "grad_norm_encoder": float(gn_enc),
+                        "grad_norm_adapter": float(gn_adp),
+                        "grad_norm_icl": float(gn_icl),
+                        "lr": float(self.scheduler.get_last_lr()[0]),
+                    }
+                )
+                return results
+
+        # Step
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.scheduler.step()
+
+        results.update(
+            {
+                "grad_norm": float(total_gn),
+                "grad_norm_encoder": float(gn_enc),
+                "grad_norm_adapter": float(gn_adp),
+                "grad_norm_icl": float(gn_icl),
+                "lr": float(self.scheduler.get_last_lr()[0]),
+            }
+        )
+        return results
+
+    def train_overfit_one_episode(self) -> None:
+        """Run overfit-one-episode debug loop and exit."""
+        overfit_steps = int(getattr(self.config, "overfit_steps", 300))
+        seed = int(getattr(self.config, "overfit_seed", 1234))
+        freeze_prior = bool(getattr(self.config, "overfit_freeze_prior", True))
+
+        if self.master_process:
+            print(
+                f"[overfit] mode=one_episode steps={overfit_steps} seed={seed} freeze_prior={freeze_prior} ddp={self.ddp}",
+                flush=True,
+            )
+
+        cached = self.make_cached_episode(seed)
+        self._overfit_cached_batch = cached
+
+        tracked = self._pick_param_to_track()
+        track_name = None
+        track_prev = None
+        if tracked is not None:
+            track_name, track_param = tracked
+            track_prev = track_param.detach().float().cpu().clone()
+            if self.master_process:
+                print(f"[overfit] tracking param_delta on: {track_name}", flush=True)
+        else:
+            if self.master_process:
+                print("[overfit] warning: no trainable parameter found for param_delta tracking", flush=True)
+
+        delta_every = 50
+        last_ce: list[float] = []
+        last_acc: list[float] = []
+        last_gn: list[float] = []
+        last_delta: list[float] = []
+
+        # Compute and print episode-level K + Nq_valid from the first micro-batch (no forward needed).
+        try:
+            X0, y0, _d0, _sl0, ts0 = cached
+            train_size0 = int(ts0[0].item())
+            y_train0 = y0[: self.config.micro_batch_size, :train_size0].long()
+            y_test0 = y0[: self.config.micro_batch_size, train_size0:].long()
+            # C here is model head size (model_max_classes). We conservatively infer it from config.
+            Cmax = int(getattr(self.config, "model_max_classes", getattr(self.config, "max_classes", 0)))
+            active_idx0 = torch.unique(y_train0).sort().values.long()
+            active_idx0 = active_idx0[(active_idx0 >= 0) & (active_idx0 < Cmax)]
+            K0 = int(active_idx0.numel())
+            valid0 = (y_test0.reshape(-1) >= 0) & (y_test0.reshape(-1) < Cmax)
+            Nq_valid0 = int(valid0.long().sum().item())
+            if self.master_process:
+                print(f"[overfit] episode debug: K={K0} active_idx={active_idx0.detach().cpu().tolist()} Nq_valid={Nq_valid0}", flush=True)
+        except Exception:
+            pass
+
+        start_time = time.time()
+        for i in range(overfit_steps):
+            # Optionally regenerate each step (slow path). Default is cached reuse.
+            if not freeze_prior:
+                batch = self.make_cached_episode(seed)
+            else:
+                batch = cached
+
+            metrics = self.train_step_on_batch(batch)
+            ce = float(metrics.get("ce", 0.0))
+            acc = float(metrics.get("accuracy", 0.0))
+            gn = float(metrics.get("grad_norm", 0.0))
+
+            param_delta = float("nan")
+            if track_name is not None and track_prev is not None and ((i + 1) % delta_every == 0 or i == 0):
+                p_now = dict(self.raw_model.named_parameters()).get(track_name, None)
+                if p_now is not None:
+                    now_cpu = p_now.detach().float().cpu()
+                    param_delta = float(torch.norm(now_cpu - track_prev).item())
+                    track_prev = now_cpu.clone()
+                    last_delta.append(param_delta)
+
+            # Keep last-10 stats
+            last_ce.append(ce)
+            last_acc.append(acc)
+            last_gn.append(gn)
+            if len(last_ce) > 10:
+                last_ce.pop(0)
+                last_acc.pop(0)
+                last_gn.pop(0)
+
+            if self.master_process:
+                lr = float(metrics.get("lr", 0.0))
+                msg = (
+                    f"[overfit] step={i+1}/{overfit_steps} ce={ce:.4f} acc={acc:.4f} "
+                    f"gn={gn:.3e} (enc={metrics.get('grad_norm_encoder', 0.0):.3e}, "
+                    f"adp={metrics.get('grad_norm_adapter', 0.0):.3e}, icl={metrics.get('grad_norm_icl', 0.0):.3e}) "
+                    f"lr={lr:.3e}"
+                )
+                if (i + 1) % delta_every == 0 or i == 0:
+                    msg += f" param_delta={param_delta:.3e}"
+                print(msg, flush=True)
+
+            self.curr_step += 1
+
+        # Summary + diagnosis
+        mean_ce = float(sum(last_ce) / max(1, len(last_ce)))
+        mean_acc = float(sum(last_acc) / max(1, len(last_acc)))
+        mean_gn = float(sum(last_gn) / max(1, len(last_gn)))
+        elapsed = time.time() - start_time
+
+        if self.master_process:
+            print(
+                f"[overfit] done in {elapsed:.1f}s. last10_mean_ce={mean_ce:.4f} last10_mean_acc={mean_acc:.4f} last10_mean_gn={mean_gn:.3e}",
+                flush=True,
+            )
+            success = (mean_acc >= 0.9) or (mean_ce < 0.8)
+            if success:
+                print("[overfit] SUCCESS: model can overfit this fixed episode.", flush=True)
+            else:
+                print("[overfit] FAIL: acc/ce did not improve enough on a fixed episode.", flush=True)
+                print("[overfit] Diagnosis hints:", flush=True)
+                print("  - optimizer.step not happening / scaler skipping steps", flush=True)
+                print("  - grads are ~0 (frozen params, detached loss, wrong requires_grad)", flush=True)
+                print("  - loss not connected to logits (masking/indexing bug)", flush=True)
+                print("  - episode construction prevents learning (query labels mismatch / context leakage issues)", flush=True)
+                print(
+                    f"  - observed: mean_grad_norm={mean_gn:.3e}, last_param_delta_samples={last_delta[-5:] if last_delta else []}",
+                    flush=True,
+                )
+
+        # Make sure all ranks exit together under DDP.
+        if self.ddp and torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.barrier()
+            except Exception:
+                pass
+        raise SystemExit(0)
+
     def build_model(self):
         prior_type = str(getattr(self.config, "prior_type", ""))
         if prior_type not in {"mlp_scm", "tree_scm", "mix_scm", "cauker_icl"}:
@@ -945,4 +1345,6 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"CuPy unavailable or no CUDA device: {exc}")
     trainer = Trainer(cfg)
+    if bool(getattr(cfg, "overfit_one_episode", False)):
+        trainer.train_overfit_one_episode()
     trainer.train()
