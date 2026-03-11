@@ -17,6 +17,10 @@ _SRC_DIR = Path(__file__).resolve().parents[2]
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
+_DEFAULT_TICFM_PRETRAINED_CHECKPOINT = (
+    Path(__file__).resolve().parents[4] / "checkpoints" / "mantis_orion_icl_full.pt"
+)
+
 from orion_msp.model.learning import ICLearning
 from orion_msp.model.mantis_adapter_plus_orion_icl import _MantisAdapterPlusOrionICL
 from orion_msp.train.run import Trainer as _BaseTrainer
@@ -84,6 +88,29 @@ def _extend_parser(parser):
         help="Model head output classes (ICL predictor). Decoupled from prior --max_classes.",
     )
 
+    # Full-model pretrained TIC-FM init for end-to-end finetuning.
+    parser.add_argument(
+        "--init_from_ticfm_pretrained",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Initialize _MantisAdapterPlusOrionICL from a pretrained TIC-FM full-model checkpoint, "
+            "then continue end-to-end training with a fresh optimizer/scheduler state."
+        ),
+    )
+    parser.add_argument(
+        "--ticfm_pretrained_checkpoint",
+        type=str,
+        default=str(_DEFAULT_TICFM_PRETRAINED_CHECKPOINT),
+        help="Path to the pretrained TIC-FM full-model checkpoint used for initialization.",
+    )
+    parser.add_argument(
+        "--ticfm_pretrained_strict",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Use strict=True when loading the TIC-FM pretrained checkpoint.",
+    )
+
     # DDP knobs
     parser.add_argument(
         "--ddp_find_unused_parameters",
@@ -101,6 +128,16 @@ def _extend_parser(parser):
         help=(
             "Print trainable parameter names with grad=None after the last micro-batch backward of each step. "
             "Useful to identify parameters that will trigger DDP reduction errors."
+        ),
+    )
+
+    parser.add_argument(
+        "--force_flash_sdpa",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Force Flash SDPA by disabling other SDPA backends. This will error if Flash is unsupported "
+            "for the current dtype/shape/device."
         ),
     )
 
@@ -253,6 +290,42 @@ class Trainer(_BaseTrainer):
         ref_model.load_state_dict(cleaned, strict=False)
         ref_model.eval()
         self.ref_eval_model = ref_model
+
+    @staticmethod
+    def _extract_state_dict(ckpt_obj: object) -> dict[str, Tensor]:
+        if isinstance(ckpt_obj, dict):
+            for key in ("state_dict", "model_state_dict", "model"):
+                value = ckpt_obj.get(key)
+                if isinstance(value, dict):
+                    return {str(k).replace("module.", ""): v for k, v in value.items()}
+            if all(isinstance(k, str) for k in ckpt_obj.keys()):
+                return {str(k).replace("module.", ""): v for k, v in ckpt_obj.items()}
+        raise ValueError("Unsupported TIC-FM checkpoint format; expected a dict or state_dict.")
+
+    def _maybe_init_from_ticfm_pretrained(self, model: torch.nn.Module) -> None:
+        if not bool(getattr(self.config, "init_from_ticfm_pretrained", False)):
+            return
+
+        ckpt_path = Path(str(getattr(self.config, "ticfm_pretrained_checkpoint", ""))).expanduser()
+        if not ckpt_path.is_absolute():
+            ckpt_path = Path.cwd() / ckpt_path
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"TIC-FM pretrained checkpoint not found: {ckpt_path}")
+
+        ckpt_obj = torch.load(str(ckpt_path), map_location="cpu")
+        state_dict = self._extract_state_dict(ckpt_obj)
+        incompatible = model.load_state_dict(
+            state_dict,
+            strict=bool(getattr(self.config, "ticfm_pretrained_strict", True)),
+        )
+
+        if self.master_process:
+            print(f"Initialized model from TIC-FM checkpoint: {ckpt_path}")
+            if incompatible is not None:
+                if getattr(incompatible, "missing_keys", None):
+                    print(f"  Missing keys: {len(incompatible.missing_keys)}")
+                if getattr(incompatible, "unexpected_keys", None):
+                    print(f"  Unexpected keys: {len(incompatible.unexpected_keys)}")
 
     @staticmethod
     def _pad_or_truncate_features(x: Tensor, target_dim: int) -> Tensor:
@@ -589,6 +662,8 @@ class Trainer(_BaseTrainer):
             mantis_batch_size=int(getattr(self.config, "mantis_batch_size", 256)),
         ).to(self.config.device)
 
+        self._maybe_init_from_ticfm_pretrained(model)
+
         self.model_config = {
             "model": "_MantisAdapterPlusOrionICL",
             "mantis": {
@@ -618,6 +693,15 @@ class Trainer(_BaseTrainer):
                 "norm_first": bool(self.config.norm_first),
                 "perc_num_latents": int(self.config.perc_num_latents),
                 "perc_layers": int(self.config.perc_layers),
+            },
+            "pretrained_init": {
+                "enabled": bool(getattr(self.config, "init_from_ticfm_pretrained", False)),
+                "checkpoint": (
+                    str(getattr(self.config, "ticfm_pretrained_checkpoint", ""))
+                    if bool(getattr(self.config, "init_from_ticfm_pretrained", False))
+                    else None
+                ),
+                "strict": bool(getattr(self.config, "ticfm_pretrained_strict", True)),
             },
         }
 
@@ -792,6 +876,38 @@ if __name__ == "__main__":
     parser = build_parser()
     parser = _extend_parser(parser)
     cfg = parser.parse_args()
+    if bool(getattr(cfg, "force_flash_sdpa", False)) and torch.cuda.is_available():
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(False)
+            torch.backends.cuda.enable_cudnn_sdp(False)
+            print("Forced SDPA backend: flash only")
+        except Exception as exc:
+            print(f"Failed to force flash SDPA backend: {exc}")
+    # Log SDPA backend settings and priority order for runtime verification.
+    if torch.cuda.is_available():
+        try:
+            flash = torch.backends.cuda.flash_sdp_enabled()
+            mem_eff = torch.backends.cuda.mem_efficient_sdp_enabled()
+            math = torch.backends.cuda.math_sdp_enabled()
+            cudnn = torch.backends.cuda.cudnn_sdp_enabled()
+            priority = list(torch._C._get_sdp_priority_order())
+            backend_names = {
+                0: "math",
+                1: "flash",
+                2: "mem_efficient",
+                3: "cudnn",
+                4: "overrideable",
+            }
+            priority_named = [backend_names.get(int(v), str(v)) for v in priority]
+            print(
+                "SDPA backends - flash: %s, mem_efficient: %s, math: %s, cudnn: %s"
+                % (flash, mem_eff, math, cudnn)
+            )
+            print("SDPA priority order: %s" % (" -> ".join(priority_named)))
+        except Exception as exc:
+            print(f"SDPA backend query failed: {exc}")
     try:
         import cupy as cp
 
