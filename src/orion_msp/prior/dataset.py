@@ -998,6 +998,14 @@ class CaukerICLPrior(Prior):
         icl_episode_workers: int = 1,
         icl_pool_backend: str = "thread",
         icl_program_pool_size: int = 0,
+        icl_task_pool_size: int = 0,
+        icl_replay_prob: float = 0.0,
+        icl_replay_warmup_steps: int = 0,
+        icl_replay_prob_start: float = -1.0,
+        icl_replay_prob_end: float = -1.0,
+        icl_task_pool_mode: str = "episode",
+        icl_pool_replace: str = "fifo",
+        icl_replay_debug_every: int = 100,
         icl_show_progress: bool = False,
     ):
         super().__init__(
@@ -1021,10 +1029,57 @@ class CaukerICLPrior(Prior):
         self.icl_episode_workers = max(1, int(icl_episode_workers))
         self.icl_pool_backend = str(icl_pool_backend)
         self.icl_program_pool_size = max(0, int(icl_program_pool_size))
+        self.icl_task_pool_size = max(0, int(icl_task_pool_size))
+        self.icl_replay_prob = float(icl_replay_prob)
+        self.icl_replay_warmup_steps = max(0, int(icl_replay_warmup_steps))
+        self.icl_replay_prob_start = float(icl_replay_prob_start)
+        self.icl_replay_prob_end = float(icl_replay_prob_end)
+        self.icl_task_pool_mode = str(icl_task_pool_mode)
+        self.icl_pool_replace = str(icl_pool_replace)
+        self.icl_replay_debug_every = max(0, int(icl_replay_debug_every))
         self.icl_show_progress = bool(icl_show_progress)
+        if self.icl_task_pool_mode not in {"episode", "payload"}:
+            raise ValueError(f"Unknown icl_task_pool_mode: {self.icl_task_pool_mode}")
+        if self.icl_pool_replace not in {"fifo", "random"}:
+            raise ValueError(f"Unknown icl_pool_replace: {self.icl_pool_replace}")
+
+        scheduled_probs = [max(0.0, self.icl_replay_prob)]
+        if self.icl_replay_prob_start >= 0.0:
+            scheduled_probs.append(self.icl_replay_prob_start)
+        if self.icl_replay_prob_end >= 0.0:
+            scheduled_probs.append(self.icl_replay_prob_end)
+        self._replay_enabled = self.icl_task_pool_size > 0 and max(scheduled_probs) > 0.0
+
         self._task_cursor = 0
+        self._batch_cursor = 0
         self._executor = None
+        # Replay pool is intentionally local to each rank / DataLoader worker process.
+        # We do not synchronize pool state across workers to avoid cross-process coordination.
+        self._episode_pool: list[dict[str, Any]] = []
+        self._pool_insert_ptr = 0
+        self._replay_stats: dict[str, float] = {
+            "hits": 0.0,
+            "sampled": 0.0,
+            "new": 0.0,
+            "batches": 0.0,
+        }
+        self._rng: Optional[np.random.Generator] = None
+        self._rng_seed: Optional[int] = None
+        self._active_replay_prob: Optional[float] = None
         atexit.register(self._shutdown_executor)
+        if int(os.environ.get("RANK", "0")) == 0:
+            approx_episode_bytes = self._estimate_episode_bytes()
+            approx_pool_mib = (approx_episode_bytes * self.icl_task_pool_size) / float(1024**2)
+            print(
+                "[rank0][replay-config] "
+                f"task_pool_size={self.icl_task_pool_size} replay_prob={self.icl_replay_prob:.3f} "
+                f"replay_prob_start={self.icl_replay_prob_start:.3f} replay_prob_end={self.icl_replay_prob_end:.3f} "
+                f"warmup_steps={self.icl_replay_warmup_steps} pool_mode={self.icl_task_pool_mode} "
+                f"replace={self.icl_pool_replace} program_pool_size={self.icl_program_pool_size} "
+                f"approx_episode_mem={approx_episode_bytes / float(1024**2):.2f}MiB "
+                f"approx_pool_mem={approx_pool_mib:.2f}MiB",
+                flush=True,
+            )
 
     def _shutdown_executor(self):
         executor = getattr(self, "_executor", None)
@@ -1069,6 +1124,149 @@ class CaukerICLPrior(Prior):
         self._executor = ThreadPoolExecutor(max_workers=self.icl_episode_workers)
         return self._executor
 
+    def _estimate_episode_bytes(self) -> int:
+        # For cauker_icl, x_tab is effectively (seq_len, time_length) float32 after feature reduction,
+        # and y is (seq_len,) int64. Keep this estimate simple so users can size the episode pool.
+        seq_len = int(self.max_seq_len)
+        feature_dim = int(self.icl_time_length)
+        return seq_len * feature_dim * 4 + seq_len * 8
+
+    def _ensure_rng(self) -> np.random.Generator:
+        if self._rng is not None:
+            return self._rng
+        worker = get_worker_info()
+        worker_offset = 0 if worker is None else int(worker.id) + 1
+        rank_offset = int(os.environ.get("RANK", "0"))
+        seed = int(self.icl_base_seed + rank_offset * 100_003 + worker_offset * 1_000_003)
+        self._rng_seed = seed
+        self._rng = np.random.default_rng(seed)
+        return self._rng
+
+    def _is_replay_log_owner(self) -> bool:
+        if int(os.environ.get("RANK", "0")) != 0:
+            return False
+        worker = get_worker_info()
+        return worker is None or int(worker.id) == 0
+
+    def _current_replay_prob(self) -> float:
+        if not self._replay_enabled:
+            return 0.0
+        fixed = float(self.icl_replay_prob)
+        if self.icl_replay_warmup_steps <= 0:
+            return float(np.clip(fixed, 0.0, 1.0))
+        if self.icl_replay_prob_start < 0.0 or self.icl_replay_prob_end < 0.0:
+            return float(np.clip(fixed, 0.0, 1.0))
+        progress = min(1.0, max(0.0, float(self._batch_cursor) / float(self.icl_replay_warmup_steps)))
+        p = self.icl_replay_prob_start + (self.icl_replay_prob_end - self.icl_replay_prob_start) * progress
+        return float(np.clip(p, 0.0, 1.0))
+
+    def _should_replay(self) -> bool:
+        if not self._replay_enabled or not self._episode_pool:
+            return False
+        rng = self._ensure_rng()
+        replay_prob = self._active_replay_prob if self._active_replay_prob is not None else self._current_replay_prob()
+        return bool(rng.random() < replay_prob)
+
+    def _sample_from_pool(self, rng: np.random.Generator) -> Optional[dict[str, Any]]:
+        if not self._episode_pool:
+            return None
+        idx = int(rng.integers(0, len(self._episode_pool)))
+        item = self._episode_pool[idx]
+        if self.icl_task_pool_mode == "payload":
+            return {"mode": "payload", "payload": dict(item["payload"])}
+        return {
+            "mode": "episode",
+            "payload": dict(item["payload"]),
+            "x_tab": np.array(item["x_tab"], copy=True),
+            "y_tab": np.array(item["y_tab"], copy=True),
+            "n_ctx": int(item["n_ctx"]),
+        }
+
+    def _insert_into_pool(self, item: dict[str, Any]) -> None:
+        if not self._replay_enabled or self.icl_task_pool_size <= 0:
+            return
+        if len(self._episode_pool) < self.icl_task_pool_size:
+            self._episode_pool.append(item)
+            return
+        if self.icl_pool_replace == "random":
+            rng = self._ensure_rng()
+            idx = int(rng.integers(0, len(self._episode_pool)))
+            self._episode_pool[idx] = item
+            return
+        idx = int(self._pool_insert_ptr % self.icl_task_pool_size)
+        self._episode_pool[idx] = item
+        self._pool_insert_ptr = (self._pool_insert_ptr + 1) % self.icl_task_pool_size
+
+    def _make_pool_item(self, result: Tuple[np.ndarray, np.ndarray, int], payload: Dict[str, Any]) -> dict[str, Any]:
+        if self.icl_task_pool_mode == "payload":
+            return {"mode": "payload", "payload": dict(payload)}
+        x_tab, y_tab, n_ctx = result
+        return {
+            "mode": "episode",
+            "payload": dict(payload),
+            "x_tab": np.array(x_tab, copy=True),
+            "y_tab": np.array(y_tab, copy=True),
+            "n_ctx": int(n_ctx),
+        }
+
+    def _materialize_pool_item(self, item: dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, int]:
+        if item["mode"] == "payload":
+            return _cauker_generate_one(dict(item["payload"]))
+        return (
+            np.array(item["x_tab"], copy=True),
+            np.array(item["y_tab"], copy=True),
+            int(item["n_ctx"]),
+        )
+
+    def _generate_payloads(self, payloads: list[Dict[str, Any]]) -> list[Tuple[np.ndarray, np.ndarray, int]]:
+        if not payloads:
+            return []
+
+        executor = self._get_executor()
+        show_progress = bool(self.icl_show_progress) and self._is_replay_log_owner()
+        if executor is None or len(payloads) <= 1:
+            if show_progress and _tqdm is not None:
+                iterator = (_cauker_generate_one(p) for p in payloads)
+                return list(
+                    _tqdm(
+                        iterator,
+                        total=len(payloads),
+                        desc="cauker batch gen",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            return [_cauker_generate_one(p) for p in payloads]
+
+        if isinstance(executor, _MPPool):
+            if show_progress and _tqdm is not None:
+                iterator = executor.imap(_cauker_generate_one, payloads)
+                return list(
+                    _tqdm(
+                        iterator,
+                        total=len(payloads),
+                        desc="cauker batch gen",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            return list(executor.map(_cauker_generate_one, payloads))
+
+        if show_progress and _tqdm is not None:
+            futures = [executor.submit(_cauker_generate_one, p) for p in payloads]
+            ordered: list[Optional[Tuple[np.ndarray, np.ndarray, int]]] = [None] * len(futures)
+            future_to_idx = {fut: idx for idx, fut in enumerate(futures)}
+            for fut in _tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="cauker batch gen",
+                leave=False,
+                dynamic_ncols=True,
+            ):
+                ordered[future_to_idx[fut]] = fut.result()
+            return [r for r in ordered if r is not None]
+        return list(executor.map(_cauker_generate_one, payloads))
+
     def _build_payload(self, task_id: int, train_size: int, seq_len: int, k_eff: int) -> Dict[str, Any]:
         ep_num_features = 1 if self.icl_single_channel else self.icl_num_features
         return {
@@ -1084,66 +1282,52 @@ class CaukerICLPrior(Prior):
             "max_parents": int(self.icl_max_parents),
             "max_lag": int(self.icl_max_lag),
             "feature_mode": str(self.icl_feature_mode),
+            # program_pool_size only reuses per-class program seeds. It is distinct from
+            # the task pool below, which replays full episode results or full payloads.
             "program_pool_size": int(self.icl_program_pool_size),
         }
 
     @torch.no_grad()
     def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch_size = batch_size or self.batch_size
+        rng = self._ensure_rng()
+        batch_replay_prob = self._current_replay_prob()
+        self._active_replay_prob = batch_replay_prob
 
         seq_len = int(self.max_seq_len)
         train_size = int(self.sample_train_size(self.min_train_size, self.max_train_size, seq_len))
         train_size = max(1, min(train_size, seq_len - 1))
         k_eff = max(1, min(int(min(self.icl_k, self.max_classes)), train_size))
 
-        task_ids = [self._task_cursor + i for i in range(batch_size)]
-        payloads = [self._build_payload(task_id, train_size, seq_len, k_eff) for task_id in task_ids]
-        executor = self._get_executor()
-        show_progress = bool(self.icl_show_progress) and int(os.environ.get("RANK", "0")) == 0
-        if executor is None or batch_size <= 1:
-            if show_progress and _tqdm is not None:
-                iterator = (_cauker_generate_one(p) for p in payloads)
-                results = list(
-                    _tqdm(
-                        iterator,
-                        total=len(payloads),
-                        desc="cauker batch gen",
-                        leave=False,
-                        dynamic_ncols=True,
-                    )
-                )
-            else:
-                results = [_cauker_generate_one(p) for p in payloads]
-        elif isinstance(executor, _MPPool):
-            if show_progress and _tqdm is not None:
-                iterator = executor.imap_unordered(_cauker_generate_one, payloads)
-                results = list(
-                    _tqdm(
-                        iterator,
-                        total=len(payloads),
-                        desc="cauker batch gen",
-                        leave=False,
-                        dynamic_ncols=True,
-                    )
-                )
-            else:
-                results = executor.map(_cauker_generate_one, payloads)
-        else:
-            if show_progress and _tqdm is not None:
-                futures = [executor.submit(_cauker_generate_one, p) for p in payloads]
-                results = []
-                for fut in _tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc="cauker batch gen",
-                    leave=False,
-                    dynamic_ncols=True,
-                ):
-                    results.append(fut.result())
-            else:
-                results = list(executor.map(_cauker_generate_one, payloads))
+        results: list[Optional[Tuple[np.ndarray, np.ndarray, int]]] = [None] * batch_size
+        new_payloads: list[Dict[str, Any]] = []
+        new_indices: list[int] = []
+        batch_hits = 0
 
-        x_tabs, y_tabs, n_ctxs = zip(*results)
+        for i in range(batch_size):
+            if self._should_replay():
+                pooled = self._sample_from_pool(rng)
+                if pooled is not None:
+                    results[i] = self._materialize_pool_item(pooled)
+                    batch_hits += 1
+                    continue
+
+            task_id = int(self._task_cursor + i)
+            payload = self._build_payload(task_id, train_size, seq_len, k_eff)
+            new_payloads.append(payload)
+            new_indices.append(i)
+
+        new_results = self._generate_payloads(new_payloads)
+        for idx, payload, result in zip(new_indices, new_payloads, new_results):
+            results[idx] = result
+            self._insert_into_pool(self._make_pool_item(result, payload))
+
+        if any(r is None for r in results):
+            raise RuntimeError("CaukerICLPrior produced an incomplete batch while mixing replay and new tasks.")
+
+        materialized = [r for r in results if r is not None]
+
+        x_tabs, y_tabs, n_ctxs = zip(*materialized)
         x_np = np.stack(x_tabs, axis=0)
         y_np = np.stack(y_tabs, axis=0)
 
@@ -1157,6 +1341,22 @@ class CaukerICLPrior(Prior):
         train_sizes = torch.tensor(n_ctxs, device=self.device, dtype=torch.long)
 
         self._task_cursor += batch_size
+        self._batch_cursor += 1
+        self._replay_stats["hits"] += float(batch_hits)
+        self._replay_stats["sampled"] += float(batch_size)
+        self._replay_stats["new"] += float(len(new_payloads))
+        self._replay_stats["batches"] += 1.0
+        self._active_replay_prob = None
+
+        if self._is_replay_log_owner() and self.icl_replay_debug_every > 0 and self._batch_cursor % self.icl_replay_debug_every == 0:
+            cum_hit = self._replay_stats["hits"] / max(1.0, self._replay_stats["sampled"])
+            hit_ratio = float(batch_hits) / max(1, batch_size)
+            print(
+                "[rank0][replay] "
+                f"step={self._batch_cursor} task_cursor={self._task_cursor} p={batch_replay_prob:.3f} "
+                f"pool={len(self._episode_pool)} hit={batch_hits}/{batch_size} ({hit_ratio:.3f}) cum_hit={cum_hit:.3f}",
+                flush=True,
+            )
         return X, y, d, seq_lens, train_sizes
 
 
@@ -1267,6 +1467,14 @@ class PriorDataset(IterableDataset):
         icl_episode_workers: int = 1,
         icl_pool_backend: str = "thread",
         icl_program_pool_size: int = 0,
+        icl_task_pool_size: int = 0,
+        icl_replay_prob: float = 0.0,
+        icl_replay_warmup_steps: int = 0,
+        icl_replay_prob_start: float = -1.0,
+        icl_replay_prob_end: float = -1.0,
+        icl_task_pool_mode: str = "episode",
+        icl_pool_replace: str = "fifo",
+        icl_replay_debug_every: int = 100,
         icl_show_progress: bool = False,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
@@ -1329,6 +1537,14 @@ class PriorDataset(IterableDataset):
                 icl_episode_workers=icl_episode_workers,
                 icl_pool_backend=icl_pool_backend,
                 icl_program_pool_size=icl_program_pool_size,
+                icl_task_pool_size=icl_task_pool_size,
+                icl_replay_prob=icl_replay_prob,
+                icl_replay_warmup_steps=icl_replay_warmup_steps,
+                icl_replay_prob_start=icl_replay_prob_start,
+                icl_replay_prob_end=icl_replay_prob_end,
+                icl_task_pool_mode=icl_task_pool_mode,
+                icl_pool_replace=icl_pool_replace,
+                icl_replay_debug_every=icl_replay_debug_every,
                 icl_show_progress=icl_show_progress,
             )
         else:

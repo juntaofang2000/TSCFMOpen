@@ -11,6 +11,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
 
 
 # Ensure we import the local workspace package (repo_root/code/src)
@@ -24,7 +25,10 @@ _DEFAULT_TICFM_PRETRAINED_CHECKPOINT = (
 
 from orion_msp.model.learning import ICLearning
 from orion_msp.model.mantis_adapter_plus_orion_icl import _MantisAdapterPlusOrionICL
+from orion_msp.prior.dataset import PriorDataset
+from orion_msp.prior.genload import LoadPriorDataset
 from orion_msp.train.run import Trainer as _BaseTrainer
+from orion_msp.train.run import _prior_worker_init_fn
 from orion_msp.train.train_config import build_parser
 
 
@@ -33,6 +37,48 @@ from tabicl.model.mantis_tabicl import build_mantis_encoder, encode_with_mantis
 
 
 def _extend_parser(parser):
+    # cauker_icl task replay / episode pool
+    parser.add_argument("--icl_task_pool_size", type=int, default=0, help="Replay task-pool size. 0 disables task replay.")
+    parser.add_argument("--icl_replay_prob", type=float, default=0.0, help="Probability of replaying an old task from the pool.")
+    parser.add_argument(
+        "--icl_replay_warmup_steps",
+        type=int,
+        default=0,
+        help="If > 0, linearly schedule replay probability during the first N batch steps.",
+    )
+    parser.add_argument(
+        "--icl_replay_prob_start",
+        type=float,
+        default=-1.0,
+        help="Warmup start replay probability. If < 0, falls back to --icl_replay_prob.",
+    )
+    parser.add_argument(
+        "--icl_replay_prob_end",
+        type=float,
+        default=-1.0,
+        help="Warmup end replay probability. If < 0, falls back to --icl_replay_prob.",
+    )
+    parser.add_argument(
+        "--icl_task_pool_mode",
+        type=str,
+        default="episode",
+        choices=["episode", "payload"],
+        help="Replay full episodes or just payload/task configs.",
+    )
+    parser.add_argument(
+        "--icl_pool_replace",
+        type=str,
+        default="fifo",
+        choices=["fifo", "random"],
+        help="Replacement policy once the replay pool is full.",
+    )
+    parser.add_argument(
+        "--icl_replay_debug_every",
+        type=int,
+        default=100,
+        help="Print replay hit/pool stats every N prior batches on rank0/worker0.",
+    )
+
     # Mantis encoder
     parser.add_argument("--mantis_seq_len", type=int, default=512)
     parser.add_argument("--mantis_hidden_dim", type=int, default=512)
@@ -189,6 +235,76 @@ class Trainer(_BaseTrainer):
         super().__init__(config)
         self._configure_mantis_eval()
         self._configure_ref_eval()
+
+    def configure_prior(self):
+        if self.config.prior_dir is None:
+            dataset = PriorDataset(
+                batch_size=self.config.batch_size,
+                batch_size_per_gp=self.config.batch_size_per_gp,
+                min_features=self.config.min_features,
+                max_features=self.config.max_features,
+                max_classes=self.config.max_classes,
+                min_seq_len=self.config.min_seq_len,
+                max_seq_len=self.config.max_seq_len,
+                log_seq_len=self.config.log_seq_len,
+                seq_len_per_gp=self.config.seq_len_per_gp,
+                min_train_size=self.config.min_train_size,
+                max_train_size=self.config.max_train_size,
+                replay_small=self.config.replay_small,
+                prior_type=self.config.prior_type,
+                icl_k=getattr(self.config, "icl_k", 5),
+                icl_time_length=getattr(self.config, "icl_time_length", 512),
+                icl_num_features=getattr(self.config, "icl_num_features", 6),
+                icl_single_channel=getattr(self.config, "icl_single_channel", False),
+                icl_level=getattr(self.config, "icl_level", 0),
+                icl_num_nodes=getattr(self.config, "icl_num_nodes", 18),
+                icl_max_parents=getattr(self.config, "icl_max_parents", 5),
+                icl_max_lag=getattr(self.config, "icl_max_lag", 5),
+                icl_feature_mode=getattr(self.config, "icl_feature_mode", "mean"),
+                icl_base_seed=getattr(self.config, "icl_base_seed", 42),
+                icl_episode_workers=getattr(self.config, "icl_episode_workers", 1),
+                icl_pool_backend=getattr(self.config, "icl_pool_backend", "thread"),
+                icl_program_pool_size=getattr(self.config, "icl_program_pool_size", 0),
+                icl_task_pool_size=getattr(self.config, "icl_task_pool_size", 0),
+                icl_replay_prob=getattr(self.config, "icl_replay_prob", 0.0),
+                icl_replay_warmup_steps=getattr(self.config, "icl_replay_warmup_steps", 0),
+                icl_replay_prob_start=getattr(self.config, "icl_replay_prob_start", -1.0),
+                icl_replay_prob_end=getattr(self.config, "icl_replay_prob_end", -1.0),
+                icl_task_pool_mode=getattr(self.config, "icl_task_pool_mode", "episode"),
+                icl_pool_replace=getattr(self.config, "icl_pool_replace", "fifo"),
+                icl_replay_debug_every=getattr(self.config, "icl_replay_debug_every", 100),
+                icl_show_progress=getattr(self.config, "icl_show_progress", False),
+                device=self.config.prior_device,
+                n_jobs=1,
+            )
+        else:
+            dataset = LoadPriorDataset(
+                data_dir=self.config.prior_dir,
+                batch_size=self.config.batch_size,
+                ddp_world_size=self.ddp_world_size,
+                ddp_rank=self.ddp_rank,
+                start_from=self.config.load_prior_start,
+                delete_after_load=self.config.delete_after_load,
+                device=self.config.prior_device,
+            )
+
+        if self.master_process:
+            print(dataset)
+        prior_num_workers = max(0, int(getattr(self.config, "prior_num_workers", 1)))
+        dataloader_kwargs = {
+            "dataset": dataset,
+            "batch_size": None,
+            "shuffle": False,
+            "num_workers": prior_num_workers,
+            "pin_memory": True if self.config.prior_device == "cpu" else False,
+        }
+        if prior_num_workers > 0:
+            dataloader_kwargs["prefetch_factor"] = max(2, int(getattr(self.config, "prior_prefetch_factor", 4)))
+            dataloader_kwargs["persistent_workers"] = True
+            dataloader_kwargs["multiprocessing_context"] = "spawn"
+            dataloader_kwargs["worker_init_fn"] = _prior_worker_init_fn
+
+        self.dataloader = DataLoader(**dataloader_kwargs)
 
     def _configure_mantis_eval(self) -> None:
         self.mantis_eval_enabled = bool(getattr(self.config, "mantis_eval_checkpoint", None))
