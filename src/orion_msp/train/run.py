@@ -4,8 +4,10 @@ from __future__ import annotations
 import os
 import timeit
 import functools
+import queue as py_queue
 from contextlib import nullcontext
 import math
+import multiprocessing as py_mp
 import numpy as np
 
 import torch
@@ -61,6 +63,7 @@ def ddp_cleanup(func):
 class Trainer:
     def __init__(self, config):
         self.config = config
+        self.prior_log_queue = None
         self.configure_ddp()
         self.configure_wandb()
         self.build_model()
@@ -222,6 +225,12 @@ class Trainer:
             print(f"Trainable parameters: {num_params:,}")
 
     def configure_prior(self):
+        replay_log_queue = None
+        if self.master_process and str(getattr(self.config, "prior_type", "")) == "cauker_icl":
+            if int(getattr(self.config, "icl_replay_debug_every", 0)) > 0:
+                replay_log_queue = py_mp.get_context("spawn").Queue()
+        self.prior_log_queue = replay_log_queue
+
         if self.config.prior_dir is None:
             dataset = PriorDataset(
                 batch_size=self.config.batch_size,
@@ -250,6 +259,7 @@ class Trainer:
                 icl_episode_workers=getattr(self.config, "icl_episode_workers", 1),
                 icl_pool_backend=getattr(self.config, "icl_pool_backend", "thread"),
                 icl_program_pool_size=getattr(self.config, "icl_program_pool_size", 0),
+                replay_log_queue=replay_log_queue,
                 icl_show_progress=getattr(self.config, "icl_show_progress", False),
                 device=self.config.prior_device,
                 n_jobs=1,
@@ -283,6 +293,24 @@ class Trainer:
         self.dataloader = DataLoader(
             **dataloader_kwargs,
         )
+
+    def _drain_prior_log_queue(self, prog=None):
+        queue = getattr(self, "prior_log_queue", None)
+        if queue is None or not self.master_process:
+            return
+        while True:
+            try:
+                msg = queue.get_nowait()
+            except py_queue.Empty:
+                break
+            except Exception:
+                break
+            if not msg:
+                continue
+            if isinstance(prog, tqdm):
+                prog.write(str(msg))
+            else:
+                print(str(msg), flush=True)
 
     def configure_optimizer(self):
         from torch import optim
@@ -365,8 +393,10 @@ class Trainer:
         for step in prog:
             with Timer() as prior_timer:
                 batch = next(iterator)
+            self._drain_prior_log_queue(prog)
             with Timer() as train_timer:
                 results = self.run_batch(batch)
+            self._drain_prior_log_queue(prog)
             self.curr_step = step + 1
 
             if self.master_process:

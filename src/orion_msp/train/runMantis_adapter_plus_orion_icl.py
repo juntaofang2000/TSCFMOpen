@@ -237,6 +237,12 @@ class Trainer(_BaseTrainer):
         self._configure_ref_eval()
 
     def configure_prior(self):
+        replay_log_queue = None
+        if self.master_process and str(getattr(self.config, "prior_type", "")) == "cauker_icl":
+            if int(getattr(self.config, "icl_replay_debug_every", 0)) > 0:
+                replay_log_queue = mp.get_context("spawn").Queue()
+        self.prior_log_queue = replay_log_queue
+
         if self.config.prior_dir is None:
             dataset = PriorDataset(
                 batch_size=self.config.batch_size,
@@ -274,6 +280,7 @@ class Trainer(_BaseTrainer):
                 icl_pool_replace=getattr(self.config, "icl_pool_replace", "fifo"),
                 icl_replay_debug_every=getattr(self.config, "icl_replay_debug_every", 100),
                 icl_show_progress=getattr(self.config, "icl_show_progress", False),
+                replay_log_queue=replay_log_queue,
                 device=self.config.prior_device,
                 n_jobs=1,
             )

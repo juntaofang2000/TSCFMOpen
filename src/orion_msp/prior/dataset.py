@@ -21,6 +21,7 @@ import math
 import atexit
 import warnings
 import multiprocessing as mp
+import queue as py_queue
 from multiprocessing.pool import Pool as _MPPool
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Tuple, Union, Optional, Any
@@ -1007,6 +1008,7 @@ class CaukerICLPrior(Prior):
         icl_pool_replace: str = "fifo",
         icl_replay_debug_every: int = 100,
         icl_show_progress: bool = False,
+        replay_log_queue: Any = None,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -1038,6 +1040,7 @@ class CaukerICLPrior(Prior):
         self.icl_pool_replace = str(icl_pool_replace)
         self.icl_replay_debug_every = max(0, int(icl_replay_debug_every))
         self.icl_show_progress = bool(icl_show_progress)
+        self._replay_log_queue = replay_log_queue
         if self.icl_task_pool_mode not in {"episode", "payload"}:
             raise ValueError(f"Unknown icl_task_pool_mode: {self.icl_task_pool_mode}")
         if self.icl_pool_replace not in {"fifo", "random"}:
@@ -1147,6 +1150,16 @@ class CaukerICLPrior(Prior):
             return False
         worker = get_worker_info()
         return worker is None or int(worker.id) == 0
+
+    def _emit_replay_log(self, message: str) -> None:
+        queue = getattr(self, "_replay_log_queue", None)
+        if queue is not None:
+            try:
+                queue.put_nowait(str(message))
+                return
+            except Exception:
+                pass
+        print(message, flush=True)
 
     def _current_replay_prob(self) -> float:
         if not self._replay_enabled:
@@ -1351,11 +1364,13 @@ class CaukerICLPrior(Prior):
         if self._is_replay_log_owner() and self.icl_replay_debug_every > 0 and self._batch_cursor % self.icl_replay_debug_every == 0:
             cum_hit = self._replay_stats["hits"] / max(1.0, self._replay_stats["sampled"])
             hit_ratio = float(batch_hits) / max(1, batch_size)
-            print(
+            worker = get_worker_info()
+            worker_id = -1 if worker is None else int(worker.id)
+            self._emit_replay_log(
                 "[rank0][replay] "
-                f"step={self._batch_cursor} task_cursor={self._task_cursor} p={batch_replay_prob:.3f} "
-                f"pool={len(self._episode_pool)} hit={batch_hits}/{batch_size} ({hit_ratio:.3f}) cum_hit={cum_hit:.3f}",
-                flush=True,
+                f"worker={worker_id} batch={self._batch_cursor} task_cursor={self._task_cursor} p={batch_replay_prob:.3f} "
+                f"pool={len(self._episode_pool)} hit={batch_hits}/{batch_size} new={len(new_payloads)}/{batch_size} "
+                f"({1.0 - hit_ratio:.3f}) cum_hit={cum_hit:.3f}"
             )
         return X, y, d, seq_lens, train_sizes
 
@@ -1476,6 +1491,7 @@ class PriorDataset(IterableDataset):
         icl_pool_replace: str = "fifo",
         icl_replay_debug_every: int = 100,
         icl_show_progress: bool = False,
+        replay_log_queue: Any = None,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
         device: str = "cpu",
@@ -1546,6 +1562,7 @@ class PriorDataset(IterableDataset):
                 icl_pool_replace=icl_pool_replace,
                 icl_replay_debug_every=icl_replay_debug_every,
                 icl_show_progress=icl_show_progress,
+                replay_log_queue=replay_log_queue,
             )
         else:
             raise ValueError(
