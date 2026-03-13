@@ -151,22 +151,8 @@ def _cauker_generate_one(payload: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarra
     x_all = np.concatenate([x_ctx, x_qry], axis=0)
     y_all = np.concatenate([y_ctx, y_qry], axis=0)
 
-    feature_mode = str(payload["feature_mode"])
-    time_length = int(payload["time_length"])
-    if feature_mode == "first":
-        x_tab = x_all[:, 0, :]
-    elif feature_mode == "flatten":
-        x_tab = x_all.reshape(x_all.shape[0], -1)
-        target_dim = time_length
-        if x_tab.shape[1] > target_dim:
-            x_tab = x_tab[:, :target_dim]
-        elif x_tab.shape[1] < target_dim:
-            pad = np.zeros((x_tab.shape[0], target_dim - x_tab.shape[1]), dtype=x_tab.dtype)
-            x_tab = np.concatenate([x_tab, pad], axis=1)
-    else:
-        x_tab = x_all.mean(axis=1)
-
-    return x_tab.astype(np.float32, copy=False), y_all.astype(np.int64, copy=False), train_size
+    # Keep full multichannel time series: (N, C, L).
+    return x_all.astype(np.float32, copy=False), y_all.astype(np.int64, copy=False), train_size
 
 
 class Prior:

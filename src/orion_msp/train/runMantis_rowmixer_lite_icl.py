@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -61,6 +62,71 @@ class Trainer(_SharedTrainer):
                 name = name[len("_orig_mod.") :]
             cleaned[name] = value
         return cleaned
+
+    @staticmethod
+    def _extract_state_dict(ckpt_obj: object) -> dict:
+        if isinstance(ckpt_obj, dict):
+            for key in ("state_dict", "model_state_dict", "model"):
+                value = ckpt_obj.get(key)
+                if isinstance(value, dict):
+                    return value
+            if all(isinstance(k, str) for k in ckpt_obj.keys()):
+                return ckpt_obj
+        raise ValueError("Unsupported checkpoint format; expected a dict or state_dict.")
+
+    def _load_rowmixer_init_checkpoint(self, rowmixer_icl: RowMixerLiteICL) -> None:
+        ckpt_path = str(getattr(self.config, "rowmixer_init_checkpoint", "") or "").strip()
+        if not ckpt_path:
+            return
+
+        ckpt_file = Path(ckpt_path).expanduser()
+        if not ckpt_file.is_absolute():
+            ckpt_file = Path.cwd() / ckpt_file
+        if not ckpt_file.is_file():
+            raise FileNotFoundError(f"RowMixerLiteICL init checkpoint not found: {ckpt_file}")
+
+        ckpt_obj = torch.load(str(ckpt_file), map_location="cpu")
+        full_state = self._clean_state_dict(self._extract_state_dict(ckpt_obj))
+        module_state = rowmixer_icl.state_dict()
+
+        candidate_prefixes = (
+            "rowmixer_icl.",
+            "model.rowmixer_icl.",
+            "raw_model.rowmixer_icl.",
+            "module.rowmixer_icl.",
+            "_orig_mod.rowmixer_icl.",
+        )
+
+        state_to_load = {k: v for k, v in full_state.items() if k in module_state}
+        if not state_to_load:
+            for prefix in candidate_prefixes:
+                stripped = {
+                    k[len(prefix) :]: v
+                    for k, v in full_state.items()
+                    if k.startswith(prefix) and k[len(prefix) :] in module_state
+                }
+                if stripped:
+                    state_to_load = stripped
+                    break
+
+        if not state_to_load:
+            raise RuntimeError(
+                "No RowMixerLiteICL weights matched the checkpoint. "
+                f"checkpoint={ckpt_file}"
+            )
+
+        incompatible = rowmixer_icl.load_state_dict(
+            state_to_load,
+            strict=bool(getattr(self.config, "rowmixer_init_strict", False)),
+        )
+        if self.master_process:
+            print(f"Initialized RowMixerLiteICL from checkpoint: {ckpt_file}")
+            print(f"  Loaded tensors: {len(state_to_load)}")
+            if incompatible is not None:
+                if getattr(incompatible, "missing_keys", None):
+                    print(f"  Missing keys: {len(incompatible.missing_keys)}")
+                if getattr(incompatible, "unexpected_keys", None):
+                    print(f"  Unexpected keys: {len(incompatible.unexpected_keys)}")
 
     def _build_single_channel_mantis(self, *, mantis_checkpoint=None, hidden_dim: int, seq_len: int, num_patches: int, use_fddm: bool):
         return build_mantis_encoder(
@@ -386,9 +452,12 @@ class Trainer(_SharedTrainer):
 
         mantis_seq_len = int(getattr(self.config, "mantis_seq_len", 512))
         mantis_hidden_dim = int(getattr(self.config, "mantis_hidden_dim", 512))
+        mantis_init_checkpoint = getattr(self.config, "mantis_init_checkpoint", None)
+        if mantis_init_checkpoint is not None:
+            mantis_init_checkpoint = str(mantis_init_checkpoint).strip() or None
 
         mantis_model = build_mantis_encoder(
-            mantis_checkpoint=None,
+            mantis_checkpoint=mantis_init_checkpoint,
             device=self.config.device,
             hidden_dim=mantis_hidden_dim,
             seq_len=mantis_seq_len,
@@ -420,6 +489,7 @@ class Trainer(_SharedTrainer):
             perc_num_latents=int(self.config.perc_num_latents),
             perc_layers=int(self.config.perc_layers),
         ).to(self.config.device)
+        self._load_rowmixer_init_checkpoint(rowmixer_icl)
 
         model = _MantisPlusRowMixerLiteICL(
             mantis_model=mantis_model,
@@ -431,7 +501,7 @@ class Trainer(_SharedTrainer):
         self.model_config = {
             "model": "_MantisPlusRowMixerLiteICL",
             "mantis": {
-                "ckpt": None,
+                "ckpt": mantis_init_checkpoint,
                 "seq_len": mantis_seq_len,
                 "hidden_dim": mantis_hidden_dim,
                 "num_patches": int(getattr(self.config, "mantis_num_patches", 32)),
@@ -441,6 +511,7 @@ class Trainer(_SharedTrainer):
                 "per_channel_concat": True,
             },
             "rowmixer_icl": {
+                "init_ckpt": (str(getattr(self.config, "rowmixer_init_checkpoint", "") or "") or None),
                 "max_classes": int(model_max_classes),
                 "embed_dim": int(self.config.embed_dim),
                 "patch_size": int(getattr(self.config, "rowmixer_patch_size", 8)),
@@ -483,6 +554,28 @@ class Trainer(_SharedTrainer):
             print(f"Trainable parameters: {num_params:,}")
 
 
+def _extend_rowmixer_init_parser(parser):
+    parser.add_argument(
+        "--mantis_init_checkpoint",
+        type=str,
+        default=None,
+        help="Path to mantis checkpoint used to initialize the trainable mantis encoder.",
+    )
+    parser.add_argument(
+        "--rowmixer_init_checkpoint",
+        type=str,
+        default=None,
+        help="Path to RowMixerLiteICL checkpoint used to initialize rowmixer_icl before training.",
+    )
+    parser.add_argument(
+        "--rowmixer_init_strict",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Use strict=True when loading --rowmixer_init_checkpoint.",
+    )
+    return parser
+
+
 if __name__ == "__main__":
     try:
         mp.set_start_method("spawn", force=True)
@@ -491,6 +584,7 @@ if __name__ == "__main__":
 
     parser = build_parser()
     parser = _extend_parser(parser)
+    parser = _extend_rowmixer_init_parser(parser)
     cfg = parser.parse_args()
     if bool(getattr(cfg, "force_flash_sdpa", False)) and torch.cuda.is_available():
         try:
