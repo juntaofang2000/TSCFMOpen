@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import timeit
 import functools
 import queue as py_queue
@@ -363,6 +364,22 @@ class Trainer:
             "curr_step": self.curr_step,
         }
         torch.save(ckpt, path)
+
+        # Save hyperparameters JSON together with checkpoint for reproducibility.
+        hparams_payload = {
+            "checkpoint_name": str(name),
+            "curr_step": int(self.curr_step),
+            "model_config": self.model_config,
+            "train_config": vars(self.config),
+        }
+
+        json_path_step = f"{os.path.splitext(path)[0]}_hparams.json"
+        with open(json_path_step, "w", encoding="utf-8") as f:
+            json.dump(hparams_payload, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+        json_path_latest = os.path.join(self.config.checkpoint_dir, "model_hparams_latest.json")
+        with open(json_path_latest, "w", encoding="utf-8") as f:
+            json.dump(hparams_payload, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
 
     def manage_checkpoint(self):
         ckpt_dir = self.config.checkpoint_dir

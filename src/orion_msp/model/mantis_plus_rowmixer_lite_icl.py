@@ -48,7 +48,15 @@ class _MantisPlusRowMixerLiteICL(nn.Module):
         return torch.cat([X, pad], dim=-1)
 
     def _encode_with_mantis(self, x_flat: Tensor) -> Tensor:
-        device = next(self.mantis_model.parameters()).device
+        # Some wrapped/compiled encoders may expose no parameters on replicas.
+        # Fall back to buffers, then input device, to avoid StopIteration on multi-GPU.
+        try:
+            device = next(self.mantis_model.parameters()).device
+        except StopIteration:
+            try:
+                device = next(self.mantis_model.buffers()).device
+            except StopIteration:
+                device = x_flat.device
         x_flat = x_flat.to(device)
 
         outs: list[Tensor] = []

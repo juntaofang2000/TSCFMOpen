@@ -958,10 +958,19 @@ class CaukerICLPrior(Prior):
     """Episode-based time-series classification prior for ICL training.
 
     Internally samples labeled episodes from `synth_cauker_icl.generate_episode`,
-    then converts each episode to the trainer contract:
-      - X: (seq_len, feature_dim)
-      - y: (seq_len,)
-      - train_size: split point between context and query
+        and returns each episode in multichannel time-series form:
+            - X: (N, C, L)
+            - y: (N,)
+            - train_size: split point between context and query
+
+        Dimension semantics:
+            - N: number of rows/samples in one episode (context + query)
+            - C: number of channels/features per sample
+            - L: time length per channel
+
+        Notes:
+            - No feature_mode reduction is applied in this class.
+            - Batch output shape is (B, N, C, L) in `get_batch`.
     """
 
     def __init__(
@@ -1114,8 +1123,9 @@ class CaukerICLPrior(Prior):
         return self._executor
 
     def _estimate_episode_bytes(self) -> int:
-        # For cauker_icl, x_tab is effectively (seq_len, time_length) float32 after feature reduction,
-        # and y is (seq_len,) int64. Keep this estimate simple so users can size the episode pool.
+        # For cauker_icl, each episode item is x_tab: (N, C, L) float32 and y_tab: (N,) int64.
+        # This estimate intentionally uses a simplified single-channel approximation for quick sizing.
+        # Actual pool memory can be larger when C > 1.
         seq_len = int(self.max_seq_len)
         feature_dim = int(self.icl_time_length)
         return seq_len * feature_dim * 4 + seq_len * 8

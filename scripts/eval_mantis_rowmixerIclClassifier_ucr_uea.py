@@ -1,3 +1,4 @@
+# 数据增强只用于embeding 后
 from __future__ import annotations
 
 import argparse
@@ -19,6 +20,7 @@ from tabicl.model.mantis_tabicl import build_mantis_encoder  # noqa: E402
 from tabicl.prior.data_reader import DataReader  # noqa: E402
 from tabicl.model.mantis_dev.adapters import VarianceBasedSelector  # noqa: E402
 
+from orion_msp.model.mantis_plus_rowmixer_lite_icl import _MantisPlusRowMixerLiteICL  # noqa: E402
 from orion_msp.sklearn.classifier import RowMixerLiteICLClassifier  # noqa: E402
 
 
@@ -121,6 +123,87 @@ def _print_json(title: str, payload: dict) -> None:
     except Exception:
         text = str(payload)
     print(f"\n{title}\n{text}\n")
+
+
+def _load_rowmixer_config_from_ckpt(ckpt_path: str) -> dict:
+    """Load rowmixer config from checkpoint for reproducible full-model export."""
+    try:
+        ckpt_obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt_obj = torch.load(str(ckpt_path), map_location="cpu")
+
+    if not isinstance(ckpt_obj, dict):
+        raise ValueError(f"Invalid rowmixer checkpoint object: {type(ckpt_obj)}")
+    cfg = ckpt_obj.get("config")
+    if not isinstance(cfg, dict) or not cfg:
+        raise ValueError("RowMixer checkpoint must contain a non-empty 'config' dict.")
+    return dict(cfg)
+
+
+def _export_full_model_bundle(
+    *,
+    mantis_model: torch.nn.Module,
+    rowmixer_model: torch.nn.Module,
+    mantis_ckpt: str,
+    mantis_hidden_dim: int,
+    mantis_seq_len: int,
+    mantis_batch_size: int,
+    rowmixer_ckpt: str,
+    rowmixer_cfg: dict,
+    full_ckpt_out: str,
+    full_hparams_json_out: str,
+) -> tuple[Path, Path]:
+    """Export full Mantis+RowMixer model and aligned hparams JSON.
+
+    Output format is compatible with scripts/eval_mantis_rowmixer_lite_icl_classifier_ucrHao_full.py.
+    """
+
+    full_model = _MantisPlusRowMixerLiteICL(
+        mantis_model=mantis_model,
+        rowmixer_icl=rowmixer_model,
+        mantis_seq_len=int(mantis_seq_len),
+        mantis_batch_size=int(mantis_batch_size),
+    )
+    full_model.eval()
+
+    full_ckpt_path = Path(str(full_ckpt_out)).expanduser()
+    full_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    state_dict_cpu = {k: v.detach().cpu() for k, v in full_model.state_dict().items()}
+    torch.save(
+        {
+            "model": "_MantisPlusRowMixerLiteICL",
+            "state_dict": state_dict_cpu,
+            "meta": {
+                "mantis_ckpt": str(mantis_ckpt),
+                "rowmixer_ckpt": str(rowmixer_ckpt),
+            },
+        },
+        str(full_ckpt_path),
+    )
+
+    mantis_cfg = {
+        "hidden_dim": int(mantis_hidden_dim),
+        "seq_len": int(mantis_seq_len),
+        "batch_size": int(mantis_batch_size),
+    }
+    full_hparams = {
+        "model": "_MantisPlusRowMixerLiteICL",
+        "model_config": {
+            "mantis": mantis_cfg,
+            "rowmixer_icl": dict(rowmixer_cfg),
+        },
+        # Keep top-level fields for easier inspection / compatibility.
+        "mantis": mantis_cfg,
+        "rowmixer_icl": dict(rowmixer_cfg),
+    }
+
+    full_hparams_path = Path(str(full_hparams_json_out)).expanduser()
+    full_hparams_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(full_hparams_path, "w", encoding="utf-8") as f:
+        json.dump(full_hparams, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+    return full_ckpt_path, full_hparams_path
 
 
 def _collect_rowmixer_hparams(*, model: torch.nn.Module, ckpt_path: str) -> dict:
@@ -321,6 +404,23 @@ def _parse_args() -> argparse.Namespace:
         default="evaluation_results/rowmixer_lite_icl_hparams.json",
         help="Path to save RowMixerLiteICL hyperparameters JSON.",
     )
+    p.add_argument(
+        "--export-full-model-ckpt",
+        type=str,
+        default="evaluation_results/mantis_rowmixer_lite_icl_full.pt",
+        help="Path to save full Mantis+RowMixer model checkpoint for full evaluation script.",
+    )
+    p.add_argument(
+        "--export-full-model-hparams-json",
+        type=str,
+        default="evaluation_results/mantis_rowmixer_lite_icl_model_hparams.json",
+        help="Path to save full-model hyperparameters JSON for full evaluation script.",
+    )
+    p.add_argument(
+        "--no-export-full-model",
+        action="store_true",
+        help="Disable exporting full Mantis+RowMixer checkpoint/hparams.",
+    )
 
     return p.parse_args()
 
@@ -379,6 +479,24 @@ def main() -> None:
     clf._load_model()
     model_hparams = _collect_rowmixer_hparams(model=clf.model_, ckpt_path=str(args.rowmixer_ckpt))
     _print_json(title="[RowMixerLiteICL][ModelHyperparams]", payload=model_hparams)
+
+    rowmixer_cfg = _load_rowmixer_config_from_ckpt(str(args.rowmixer_ckpt))
+
+    if not bool(args.no_export_full_model):
+        full_ckpt_path, full_hparams_path = _export_full_model_bundle(
+            mantis_model=mantis_model,
+            rowmixer_model=clf.model_,
+            mantis_ckpt=str(args.mantis_ckpt),
+            mantis_hidden_dim=int(args.mantis_hidden_dim),
+            mantis_seq_len=int(args.mantis_seq_len),
+            mantis_batch_size=int(args.mantis_batch_size),
+            rowmixer_ckpt=str(args.rowmixer_ckpt),
+            rowmixer_cfg=rowmixer_cfg,
+            full_ckpt_out=str(args.export_full_model_ckpt),
+            full_hparams_json_out=str(args.export_full_model_hparams_json),
+        )
+        print(f"[Saved] {full_ckpt_path}")
+        print(f"[Saved] {full_hparams_path}")
 
     # Save hyperparams to JSON
     if hasattr(args, "rowmixer_hparams_json") and args.rowmixer_hparams_json:
