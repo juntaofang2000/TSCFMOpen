@@ -238,7 +238,7 @@ class Trainer(_BaseTrainer):
 
     def configure_prior(self):
         replay_log_queue = None
-        if self.master_process and str(getattr(self.config, "prior_type", "")) == "cauker_icl":
+        if self.master_process and str(getattr(self.config, "prior_type", "")) in {"cauker_icl", "ucr_uea_icl"}:
             if int(getattr(self.config, "icl_replay_debug_every", 0)) > 0:
                 replay_log_queue = mp.get_context("spawn").Queue()
         self.prior_log_queue = replay_log_queue
@@ -280,6 +280,13 @@ class Trainer(_BaseTrainer):
                 icl_pool_replace=getattr(self.config, "icl_pool_replace", "fifo"),
                 icl_replay_debug_every=getattr(self.config, "icl_replay_debug_every", 100),
                 icl_show_progress=getattr(self.config, "icl_show_progress", False),
+                ucruea_base_len_choices=tuple(getattr(self.config, "ucruea_base_len_choices", [64, 96, 128, 256, 512])),
+                ucruea_min_channels=int(getattr(self.config, "ucruea_min_channels", 1)),
+                ucruea_max_channels=int(getattr(self.config, "ucruea_max_channels", 8)),
+                ucruea_task_type_probs=tuple(getattr(self.config, "ucruea_task_type_probs", [0.55, 0.30, 0.15])),
+                ucruea_difficulty_probs=tuple(getattr(self.config, "ucruea_difficulty_probs", [0.40, 0.40, 0.20])),
+                ucruea_imbalance_alpha=float(getattr(self.config, "ucruea_imbalance_alpha", 1.3)),
+                ucruea_filter_retries=int(getattr(self.config, "ucruea_filter_retries", 4)),
                 replay_log_queue=replay_log_queue,
                 device=self.config.prior_device,
                 n_jobs=1,

@@ -155,6 +155,42 @@ def _cauker_generate_one(payload: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarra
     return x_all.astype(np.float32, copy=False), y_all.astype(np.int64, copy=False), train_size
 
 
+def _ucr_uea_generate_one(payload: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Generate one UCR/UEA-targeted ICL episode.
+
+    Returns
+    -------
+    x_all : np.ndarray
+        Episode instances with shape (N, C, L), dtype float32.
+
+    y_all : np.ndarray
+        Episode labels with shape (N,), dtype int64.
+
+    train_size : int
+        Context/query split index (number of context instances).
+    """
+
+    from .synth_ucr_uea_icl import generate_episode_from_payload
+
+    ep = generate_episode_from_payload(payload)
+    x_all = np.asarray(ep["x_all"], dtype=np.float32)
+    y_all = np.asarray(ep["y_all"], dtype=np.int64)
+    train_size = int(ep["n_ctx"])
+
+    return x_all, y_all, train_size
+
+
+def _ucr_uea_generate_one_retry(payload: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, int]:
+    retries = int(payload.get("filter_retries", 1))
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, retries)):
+        try:
+            return _ucr_uea_generate_one(payload)
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"Failed to generate ucr_uea episode after retries: {last_exc}")
+
+
 class Prior:
     """
     Abstract base class for dataset prior generators.
@@ -1371,6 +1407,260 @@ class CaukerICLPrior(Prior):
         return X, y, d, seq_lens, train_sizes
 
 
+class UCRUEAICLPrior(CaukerICLPrior):
+    """UCR/UEA-targeted synthetic prior for time-series ICL.
+
+    This class keeps the same trainer-facing interface as `CaukerICLPrior`:
+    `get_batch()` returns `(X, y, d, seq_lens, train_sizes)`.
+
+    Episode tensor semantics in this class:
+      - Per episode: `X` is (N, C, L), `y` is (N,)
+      - Per batch: `X` is (B, N, C, L), `y` is (B, N)
+
+    Where:
+      - N: number of instances (context + query)
+      - C: channel count per instance
+      - L: time length per channel
+
+    Replay/pool/payload behavior is intentionally aligned with `CaukerICLPrior`.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 256,
+        max_classes: int = 10,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        max_seq_len: int = 1024,
+        prior_device: str = "cpu",
+        # task sizing
+        icl_k: int = 5,
+        ucruea_base_len_choices: tuple[int, ...] = (64, 96, 128, 256, 512),
+        ucruea_min_channels: int = 1,
+        ucruea_max_channels: int = 8,
+        ucruea_task_type_probs: tuple[float, float, float] = (0.55, 0.30, 0.15),
+        ucruea_difficulty_probs: tuple[float, float, float] = (0.40, 0.40, 0.20),
+        ucruea_imbalance_alpha: float = 1.3,
+        ucruea_filter_retries: int = 4,
+        # replay / pool
+        icl_base_seed: int = 42,
+        icl_episode_workers: int = 1,
+        icl_pool_backend: str = "thread",
+        icl_task_pool_size: int = 0,
+        icl_replay_prob: float = 0.0,
+        icl_replay_warmup_steps: int = 0,
+        icl_replay_prob_start: float = -1.0,
+        icl_replay_prob_end: float = -1.0,
+        icl_task_pool_mode: str = "episode",
+        icl_pool_replace: str = "fifo",
+        icl_replay_debug_every: int = 100,
+        icl_show_progress: bool = False,
+        replay_log_queue: Any = None,
+    ):
+        # Set subclass attributes before calling super().__init__ because the parent
+        # constructor invokes _estimate_episode_bytes(), which is overridden here.
+        base_len_choices_norm = tuple(int(v) for v in ucruea_base_len_choices)
+        min_channels_norm = int(max(1, ucruea_min_channels))
+        max_channels_norm = int(max(min_channels_norm, ucruea_max_channels))
+        task_type_probs_norm = tuple(float(v) for v in ucruea_task_type_probs)
+        difficulty_probs_norm = tuple(float(v) for v in ucruea_difficulty_probs)
+        imbalance_alpha_norm = float(max(0.2, ucruea_imbalance_alpha))
+        filter_retries_norm = int(max(1, ucruea_filter_retries))
+
+        self.ucruea_base_len_choices = base_len_choices_norm
+        self.ucruea_min_channels = min_channels_norm
+        self.ucruea_max_channels = max_channels_norm
+        self.ucruea_task_type_probs = task_type_probs_norm
+        self.ucruea_difficulty_probs = difficulty_probs_norm
+        self.ucruea_imbalance_alpha = imbalance_alpha_norm
+        self.ucruea_filter_retries = filter_retries_norm
+        self._active_fixed_time_length: Optional[int] = None
+        self._active_fixed_channels: Optional[int] = None
+        self._active_fixed_task_type: Optional[str] = None
+
+        # Reuse CaukerICLPrior infrastructure for replay/pool/get_batch contract.
+        super().__init__(
+            batch_size=batch_size,
+            max_classes=max_classes,
+            min_train_size=min_train_size,
+            max_train_size=max_train_size,
+            max_seq_len=max_seq_len,
+            prior_device=prior_device,
+            icl_k=icl_k,
+            icl_time_length=int(max(base_len_choices_norm)),
+            icl_num_features=int(max_channels_norm),
+            icl_single_channel=False,
+            icl_level=0,
+            icl_num_nodes=18,
+            icl_max_parents=5,
+            icl_max_lag=5,
+            icl_feature_mode="mean",
+            icl_base_seed=icl_base_seed,
+            icl_episode_workers=icl_episode_workers,
+            icl_pool_backend=icl_pool_backend,
+            icl_program_pool_size=0,
+            icl_task_pool_size=icl_task_pool_size,
+            icl_replay_prob=icl_replay_prob,
+            icl_replay_warmup_steps=icl_replay_warmup_steps,
+            icl_replay_prob_start=icl_replay_prob_start,
+            icl_replay_prob_end=icl_replay_prob_end,
+            icl_task_pool_mode=icl_task_pool_mode,
+            icl_pool_replace=icl_pool_replace,
+            icl_replay_debug_every=icl_replay_debug_every,
+            icl_show_progress=icl_show_progress,
+            replay_log_queue=replay_log_queue,
+        )
+
+    def _estimate_episode_bytes(self) -> int:
+        seq_len = int(self.max_seq_len)
+        avg_c = int(max(1, round((self.ucruea_min_channels + self.ucruea_max_channels) / 2)))
+        avg_l = int(sum(self.ucruea_base_len_choices) / max(1, len(self.ucruea_base_len_choices)))
+        return seq_len * avg_c * avg_l * 4 + seq_len * 8
+
+    def _build_payload(self, task_id: int, train_size: int, seq_len: int, k_eff: int) -> Dict[str, Any]:
+        payload = {
+            "task_id": int(task_id),
+            "ep_seed": int(self.icl_base_seed + task_id * 131),
+            "K": int(k_eff),
+            "train_size": int(train_size),
+            "seq_len": int(seq_len),
+            "base_len_choices": tuple(int(v) for v in self.ucruea_base_len_choices),
+            "min_channels": int(self.ucruea_min_channels),
+            "max_channels": int(self.ucruea_max_channels),
+            "task_type_probs": tuple(float(v) for v in self.ucruea_task_type_probs),
+            "difficulty_probs": tuple(float(v) for v in self.ucruea_difficulty_probs),
+            "imbalance_alpha": float(self.ucruea_imbalance_alpha),
+            "filter_retries": int(self.ucruea_filter_retries),
+        }
+        if self._active_fixed_time_length is not None:
+            payload["fixed_time_length"] = int(self._active_fixed_time_length)
+        if self._active_fixed_channels is not None:
+            payload["fixed_channels"] = int(self._active_fixed_channels)
+        if self._active_fixed_task_type is not None:
+            payload["fixed_task_type"] = str(self._active_fixed_task_type)
+        return payload
+
+    def _sample_batch_task_and_shape(self, rng: np.random.Generator) -> tuple[str, int, int]:
+        task_type = str(rng.choice(["ucr_like", "uea_like", "hybrid"], p=np.asarray(self.ucruea_task_type_probs, dtype=np.float64)))
+        time_length = int(rng.choice(np.asarray(self.ucruea_base_len_choices, dtype=np.int64)))
+        if task_type == "ucr_like":
+            channels = 1
+        elif task_type == "uea_like":
+            lo = int(max(2, self.ucruea_min_channels))
+            hi = int(max(lo, self.ucruea_max_channels))
+            channels = int(rng.integers(lo, hi + 1))
+        else:
+            lo = int(max(1, self.ucruea_min_channels))
+            hi = int(max(lo, self.ucruea_max_channels))
+            channels = int(rng.integers(lo, hi + 1))
+        return task_type, channels, time_length
+
+    def _sample_from_pool(self, rng: np.random.Generator) -> Optional[dict[str, Any]]:
+        # Keep replay episodes shape-compatible with the current batch to avoid ragged stacks.
+        if not self._episode_pool:
+            return None
+        if self._active_fixed_time_length is None and self._active_fixed_channels is None:
+            return super()._sample_from_pool(rng)
+
+        candidates = []
+        for idx, item in enumerate(self._episode_pool):
+            p = item.get("payload", {})
+            pl = p.get("fixed_time_length", None)
+            pc = p.get("fixed_channels", None)
+            if self._active_fixed_time_length is not None and int(pl) != int(self._active_fixed_time_length):
+                continue
+            if self._active_fixed_channels is not None and int(pc) != int(self._active_fixed_channels):
+                continue
+            candidates.append(idx)
+
+        if not candidates:
+            return None
+        idx = int(rng.choice(np.asarray(candidates, dtype=np.int64)))
+        item = self._episode_pool[idx]
+        if self.icl_task_pool_mode == "payload":
+            return {"mode": "payload", "payload": dict(item["payload"])}
+        return {
+            "mode": "episode",
+            "payload": dict(item["payload"]),
+            "x_tab": np.array(item["x_tab"], copy=True),
+            "y_tab": np.array(item["y_tab"], copy=True),
+            "n_ctx": int(item["n_ctx"]),
+        }
+
+    @torch.no_grad()
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        rng = self._ensure_rng()
+        task_type, channels, time_length = self._sample_batch_task_and_shape(rng)
+        self._active_fixed_task_type = task_type
+        self._active_fixed_channels = int(channels)
+        self._active_fixed_time_length = int(time_length)
+        try:
+            return super().get_batch(batch_size=batch_size)
+        finally:
+            self._active_fixed_task_type = None
+            self._active_fixed_channels = None
+            self._active_fixed_time_length = None
+
+    def _materialize_pool_item(self, item: dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, int]:
+        if item["mode"] == "payload":
+            return _ucr_uea_generate_one_retry(dict(item["payload"]))
+        return (
+            np.array(item["x_tab"], copy=True),
+            np.array(item["y_tab"], copy=True),
+            int(item["n_ctx"]),
+        )
+
+    def _generate_payloads(self, payloads: list[Dict[str, Any]]) -> list[Tuple[np.ndarray, np.ndarray, int]]:
+        if not payloads:
+            return []
+
+        executor = self._get_executor()
+        show_progress = bool(self.icl_show_progress) and self._is_replay_log_owner()
+
+        if executor is None or len(payloads) <= 1:
+            if show_progress and _tqdm is not None:
+                iterator = (_ucr_uea_generate_one_retry(p) for p in payloads)
+                return list(
+                    _tqdm(
+                        iterator,
+                        total=len(payloads),
+                        desc="ucr_uea batch gen",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            return [_ucr_uea_generate_one_retry(p) for p in payloads]
+
+        if isinstance(executor, _MPPool):
+            if show_progress and _tqdm is not None:
+                iterator = executor.imap(_ucr_uea_generate_one_retry, payloads)
+                return list(
+                    _tqdm(
+                        iterator,
+                        total=len(payloads),
+                        desc="ucr_uea batch gen",
+                        leave=False,
+                        dynamic_ncols=True,
+                    )
+                )
+            return list(executor.map(_ucr_uea_generate_one_retry, payloads))
+
+        if show_progress and _tqdm is not None:
+            futures = [executor.submit(_ucr_uea_generate_one_retry, p) for p in payloads]
+            ordered: list[Optional[Tuple[np.ndarray, np.ndarray, int]]] = [None] * len(futures)
+            future_to_idx = {fut: idx for idx, fut in enumerate(futures)}
+            for fut in _tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="ucr_uea batch gen",
+                leave=False,
+                dynamic_ncols=True,
+            ):
+                ordered[future_to_idx[fut]] = fut.result()
+            return [r for r in ordered if r is not None]
+        return list(executor.map(_ucr_uea_generate_one_retry, payloads))
+
+
 class PriorDataset(IterableDataset):
     """
     Main dataset class that provides an infinite iterator over synthetic tabular datasets.
@@ -1421,13 +1711,15 @@ class PriorDataset(IterableDataset):
         specific distributions to ensure model robustness on smaller datasets
 
     prior_type : str, default="mlp_scm"
-        Type of prior: 'mlp_scm' (default), 'tree_scm', 'mix_scm', 'cauker_icl', or 'dummy'
+        Type of prior: 'mlp_scm' (default), 'tree_scm', 'mix_scm', 'cauker_icl',
+        'ucr_uea_icl', or 'dummy'
 
         1. SCM-based: Structural causal models with complex feature relationships
          - 'mlp_scm': MLP-based causal models
          - 'tree_scm': Tree-based causal models
          - 'mix_scm': Probabilistic mix of the above models
          - 'cauker_icl': Program-based labeled episode generator for time-series classification
+         - 'ucr_uea_icl': UCR/UEA-targeted nuisance-aware episode generator
 
         2. Dummy: Randomly generated datasets for debugging
 
@@ -1487,6 +1779,13 @@ class PriorDataset(IterableDataset):
         icl_pool_replace: str = "fifo",
         icl_replay_debug_every: int = 100,
         icl_show_progress: bool = False,
+        ucruea_base_len_choices: tuple[int, ...] = (64, 96, 128, 256, 512),
+        ucruea_min_channels: int = 1,
+        ucruea_max_channels: int = 8,
+        ucruea_task_type_probs: tuple[float, float, float] = (0.55, 0.30, 0.15),
+        ucruea_difficulty_probs: tuple[float, float, float] = (0.40, 0.40, 0.20),
+        ucruea_imbalance_alpha: float = 1.3,
+        ucruea_filter_retries: int = 4,
         replay_log_queue: Any = None,
         n_jobs: int = -1,
         num_threads_per_generate: int = 1,
@@ -1560,9 +1859,39 @@ class PriorDataset(IterableDataset):
                 icl_show_progress=icl_show_progress,
                 replay_log_queue=replay_log_queue,
             )
+        elif prior_type == "ucr_uea_icl":
+            self.prior = UCRUEAICLPrior(
+                batch_size=batch_size,
+                max_classes=max_classes,
+                min_train_size=min_train_size,
+                max_train_size=max_train_size,
+                max_seq_len=max_seq_len,
+                prior_device=device,
+                icl_k=icl_k,
+                ucruea_base_len_choices=ucruea_base_len_choices,
+                ucruea_min_channels=ucruea_min_channels,
+                ucruea_max_channels=ucruea_max_channels,
+                ucruea_task_type_probs=ucruea_task_type_probs,
+                ucruea_difficulty_probs=ucruea_difficulty_probs,
+                ucruea_imbalance_alpha=ucruea_imbalance_alpha,
+                ucruea_filter_retries=ucruea_filter_retries,
+                icl_base_seed=icl_base_seed,
+                icl_episode_workers=icl_episode_workers,
+                icl_pool_backend=icl_pool_backend,
+                icl_task_pool_size=icl_task_pool_size,
+                icl_replay_prob=icl_replay_prob,
+                icl_replay_warmup_steps=icl_replay_warmup_steps,
+                icl_replay_prob_start=icl_replay_prob_start,
+                icl_replay_prob_end=icl_replay_prob_end,
+                icl_task_pool_mode=icl_task_pool_mode,
+                icl_pool_replace=icl_pool_replace,
+                icl_replay_debug_every=icl_replay_debug_every,
+                icl_show_progress=icl_show_progress,
+                replay_log_queue=replay_log_queue,
+            )
         else:
             raise ValueError(
-                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', 'cauker_icl', or 'dummy'."
+                f"Unknown prior type '{prior_type}'. Available options: 'mlp_scm', 'tree_scm', 'mix_scm', 'cauker_icl', 'ucr_uea_icl', or 'dummy'."
             )
 
         self.batch_size = batch_size
@@ -1673,3 +2002,6 @@ class DisablePrinting:
     def __exit__(self, exc_type, exc_val, exc_tb):
         sys.stdout.close()
         sys.stdout = self.original_stdout
+
+
+

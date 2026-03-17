@@ -33,6 +33,19 @@ def int_list(value):
         raise argparse.ArgumentTypeError("Expected a list of integers, e.g. '1,4,8' or '1 4 8'.")
 
 
+def float_list(value):
+    if isinstance(value, list):
+        return [float(v) for v in value]
+    s = str(value).replace(",", " ").split()
+    try:
+        out = [float(x) for x in s]
+        if len(out) == 0:
+            raise ValueError
+        return out
+    except Exception:
+        raise argparse.ArgumentTypeError("Expected a list of floats, e.g. '0.5,0.3,0.2' or '0.5 0.3 0.2'.")
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
 
@@ -160,6 +173,40 @@ def build_parser():
         default=False,
         type=str2bool,
         help="If true, show a temporary tqdm bar for each cauker_icl batch generation on rank0.",
+    )
+
+    # UCR/UEA-targeted synthetic prior knobs (used when --prior_type=ucr_uea_icl)
+    parser.add_argument(
+        "--ucruea_base_len_choices",
+        type=int_list,
+        default=[64, 96, 128, 256, 512],
+        help="Candidate time lengths L sampled per episode for ucr_uea_icl.",
+    )
+    parser.add_argument("--ucruea_min_channels", type=int, default=1)
+    parser.add_argument("--ucruea_max_channels", type=int, default=5)
+    parser.add_argument(
+        "--ucruea_task_type_probs",
+        type=float_list,
+        default=[0.55, 0.30, 0.15],
+        help="Probabilities for [ucr_like, uea_like, hybrid] task types.",
+    )
+    parser.add_argument(
+        "--ucruea_difficulty_probs",
+        type=float_list,
+        default=[0.40, 0.40, 0.20],
+        help="Probabilities for [easy, medium, hard] difficulty levels.",
+    )
+    parser.add_argument(
+        "--ucruea_imbalance_alpha",
+        type=float,
+        default=1.3,
+        help="Dirichlet alpha controlling class imbalance in ucr_uea_icl.",
+    )
+    parser.add_argument(
+        "--ucruea_filter_retries",
+        type=int,
+        default=4,
+        help="Maximum generation retries per payload when quality filter rejects an episode.",
     )
 
     # Model architecture flags

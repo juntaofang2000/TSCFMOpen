@@ -429,17 +429,17 @@ class Trainer(_SharedTrainer):
 
     def build_model(self):
         prior_type = str(getattr(self.config, "prior_type", ""))
-        if prior_type not in {"mlp_scm", "tree_scm", "mix_scm", "cauker_icl"}:
+        if prior_type not in {"mlp_scm", "tree_scm", "mix_scm", "cauker_icl", "ucr_uea_icl"}:
             raise ValueError(
                 f"This trainer is intended for SCM synthetic data; got prior_type={prior_type!r}. "
-                "Use --prior_type mlp_scm|tree_scm|mix_scm|cauker_icl."
+                "Use --prior_type mlp_scm|tree_scm|mix_scm|cauker_icl|ucr_uea_icl."
             )
 
         model_max_classes = int(getattr(self.config, "model_max_classes", 10))
         prior_max_classes = int(getattr(self.config, "max_classes", model_max_classes))
         if model_max_classes < 1:
             raise ValueError(f"model_max_classes must be >= 1, got {model_max_classes}")
-        if prior_type == "cauker_icl":
+        if prior_type in {"cauker_icl", "ucr_uea_icl"}:
             eff_prior_upper = int(min(prior_max_classes, int(getattr(self.config, "icl_k", prior_max_classes))))
         else:
             eff_prior_upper = prior_max_classes

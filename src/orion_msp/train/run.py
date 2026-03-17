@@ -262,6 +262,13 @@ class Trainer:
                 icl_program_pool_size=getattr(self.config, "icl_program_pool_size", 0),
                 replay_log_queue=replay_log_queue,
                 icl_show_progress=getattr(self.config, "icl_show_progress", False),
+                ucruea_base_len_choices=tuple(getattr(self.config, "ucruea_base_len_choices", [64, 96, 128, 256, 512])),
+                ucruea_min_channels=int(getattr(self.config, "ucruea_min_channels", 1)),
+                ucruea_max_channels=int(getattr(self.config, "ucruea_max_channels", 8)),
+                ucruea_task_type_probs=tuple(getattr(self.config, "ucruea_task_type_probs", [0.55, 0.30, 0.15])),
+                ucruea_difficulty_probs=tuple(getattr(self.config, "ucruea_difficulty_probs", [0.40, 0.40, 0.20])),
+                ucruea_imbalance_alpha=float(getattr(self.config, "ucruea_imbalance_alpha", 1.3)),
+                ucruea_filter_retries=int(getattr(self.config, "ucruea_filter_retries", 4)),
                 device=self.config.prior_device,
                 n_jobs=1,
             )
@@ -373,9 +380,13 @@ class Trainer:
             "train_config": vars(self.config),
         }
 
-        json_path_step = f"{os.path.splitext(path)[0]}_hparams.json"
-        with open(json_path_step, "w", encoding="utf-8") as f:
-            json.dump(hparams_payload, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        # Keep only a single rolling hparams JSON file to avoid accumulating many per-step files.
+        for fn in os.listdir(self.config.checkpoint_dir):
+            if fn.endswith("_hparams.json") and fn != "model_hparams_latest.json":
+                try:
+                    os.remove(os.path.join(self.config.checkpoint_dir, fn))
+                except Exception:
+                    pass
 
         json_path_latest = os.path.join(self.config.checkpoint_dir, "model_hparams_latest.json")
         with open(json_path_latest, "w", encoding="utf-8") as f:
