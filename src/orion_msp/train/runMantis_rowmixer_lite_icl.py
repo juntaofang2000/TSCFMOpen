@@ -19,12 +19,136 @@ from orion_msp.model.rowmixer_lite_icl import RowMixerLiteICL
 from orion_msp.train.run import Trainer as _BaseTrainer
 from orion_msp.train.runMantis_adapter_plus_orion_icl import Trainer as _SharedTrainer
 from orion_msp.train.runMantis_adapter_plus_orion_icl import _extend_parser
+from orion_msp.train.optim import Muon, get_scheduler
 from orion_msp.train.train_config import build_parser
 from tabicl.model.mantis_adapter_icl import TokenMLPAdapter
 from tabicl.model.mantis_tabicl import build_mantis_encoder
 
 from orion_msp.model.learning import ICLearning
 from orion_msp.model.mantis_adapter_plus_orion_icl import _MantisAdapterPlusOrionICL
+
+
+def should_use_adamw(name: str, p: torch.nn.Parameter) -> bool:
+    """Route non-2D, IO heads, and label-injection parameters to AdamW fallback."""
+    lname = name.lower()
+
+    # 1) All non-2D tensors go to AdamW.
+    if p.ndim != 2:
+        return True
+
+    # 2) Input-facing layers go to AdamW.
+    input_keywords = [
+        "patch_embed",
+        "token_embed",
+        "input_proj",
+        "in_proj",
+        "conv",
+        "embed_tokens",
+        "embedding",
+    ]
+    if any(k in lname for k in input_keywords):
+        return True
+
+    # 3) Label / one-hot injection layers go to AdamW.
+    label_keywords = [
+        "label",
+        "onehot",
+        "one_hot",
+        "ey",
+        "target_embed",
+        "embedtae",
+    ]
+    if any(k in lname for k in label_keywords):
+        return True
+
+    # 4) Output-facing layers go to AdamW.
+    output_keywords = [
+        "head",
+        "classifier",
+        "predictor",
+        "out_proj",
+        "lm_head",
+        "output",
+    ]
+    if any(k in lname for k in output_keywords):
+        return True
+
+    return False
+
+
+def build_muon_optimizer(model, lr: float, wd: float = 0.1):
+    """Build Muon+AdamW mixed optimizer from model named parameters."""
+    muon_params = []
+    adamw_params = []
+    muon_names = []
+    adamw_names = []
+
+    module_counts = {
+        "mantis_model": {"muon": 0, "adamw": 0},
+        "rowmixer_lite": {"muon": 0, "adamw": 0},
+        "icl_predictor": {"muon": 0, "adamw": 0},
+        "other": {"muon": 0, "adamw": 0},
+    }
+
+    def _bucket(param_name: str) -> str:
+        lname = param_name.lower()
+        if lname.startswith("mantis_model."):
+            return "mantis_model"
+        if "icl_predictor" in lname:
+            return "icl_predictor"
+        if lname.startswith("rowmixer_icl."):
+            return "rowmixer_lite"
+        return "other"
+
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if should_use_adamw(name, p):
+            adamw_params.append(p)
+            adamw_names.append(name)
+            module_counts[_bucket(name)]["adamw"] += 1
+        else:
+            muon_params.append(p)
+            muon_names.append(name)
+            module_counts[_bucket(name)]["muon"] += 1
+
+    print(f"[Muon] num_muon_tensors={len(muon_params)} num_adamw_tensors={len(adamw_params)}")
+    print(f"[Muon sample params] {muon_names[:20]}")
+    print(f"[AdamW sample params] {adamw_names[:20]}")
+
+    for module_name in ("mantis_model", "rowmixer_lite", "icl_predictor", "other"):
+        c = module_counts[module_name]
+        print(f"[Muon group] {module_name}: muon={c['muon']} adamw={c['adamw']}")
+
+    label_keywords = ("label", "onehot", "one_hot", "ey", "target_embed", "embedtae")
+    output_keywords = ("head", "classifier", "predictor", "out_proj", "lm_head", "output")
+    label_adamw = [n for n in adamw_names if any(k in n.lower() for k in label_keywords)]
+    adapter_muon = [n for n in muon_names if "adapter" in n.lower()]
+    icl_muon = [n for n in muon_names if "icl_predictor" in n.lower() and n.lower().endswith("weight")]
+    output_adamw = [n for n in adamw_names if any(k in n.lower() for k in output_keywords)]
+
+    print(f"[Muon check] label/one-hot -> AdamW: {len(label_adamw)} sample={label_adamw[:8]}")
+    print(f"[Muon check] adapter hidden -> Muon: {len(adapter_muon)} sample={adapter_muon[:8]}")
+    print(f"[Muon check] icl_predictor 2D -> Muon: {len(icl_muon)} sample={icl_muon[:8]}")
+    print(f"[Muon check] predictor/head/output -> AdamW: {len(output_adamw)} sample={output_adamw[:8]}")
+
+    if not muon_params:
+        print("[Muon][WARN] Muon parameter group is empty.")
+    if not adamw_params:
+        print("[Muon][WARN] AdamW parameter group is empty.")
+
+    optimizer = Muon(
+        lr=lr,
+        wd=wd,
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_betas=(0.9, 0.95),
+        adamw_eps=1e-8,
+    )
+    return optimizer
 
 
 class Trainer(_SharedTrainer):
@@ -35,6 +159,15 @@ class Trainer(_SharedTrainer):
         _BaseTrainer.__init__(self, config)
         self._configure_mantis_eval()
         self._configure_ref_eval()
+
+    def configure_optimizer(self):
+        target_model = self.raw_model if hasattr(self, "raw_model") else self.model
+        self.optimizer = build_muon_optimizer(
+            model=target_model,
+            lr=float(self.config.lr),
+            wd=0.1,
+        )
+        self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
     def align_micro_batch(self, micro_X: Tensor, micro_y: Tensor, micro_d: Tensor, seq_len: int):
         if micro_X.shape[1] > seq_len:

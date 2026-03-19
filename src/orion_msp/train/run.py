@@ -608,8 +608,7 @@ class Trainer:
 
         num_micro_batches = len(valid_micros)
         if num_micro_batches == 0:
-            # nothing to backprop this step; advance scheduler and report zeros
-            self.scheduler.step()
+            # Nothing to backprop this step; keep optimizer/scheduler untouched.
             return {"ce": 0.0, "accuracy": 0.0}
 
         micro_batches = valid_micros
@@ -619,7 +618,8 @@ class Trainer:
         for i, micro in enumerate(micro_batches):
             try:
                 res = self.run_micro_batch(micro, i, num_micro_batches)
-                for k, v in res.items(): results[k] += v
+                for k, v in res.items():
+                    results[k] = results.get(k, 0.0) + float(v)
             except torch.cuda.OutOfMemoryError:
                 print(f"OOM in micro-batch {i+1}/{num_micro_batches} at step {self.curr_step}. Skipping.")
                 torch.cuda.empty_cache(); failed += 1; continue
@@ -634,12 +634,11 @@ class Trainer:
             self.scaler.unscale_(self.optimizer)
             total_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
             if not torch.isfinite(total_norm):
-                # bad grads: skip the update but keep schedule moving
+                # Bad grads: skip optimizer update and keep LR scheduler in sync with optimizer steps.
                 if self.master_process:
                     print(f"Non-finite grad norm at step {self.curr_step}; skipping optimizer step.")
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.update()
-                self.scheduler.step()
                 return results
 
         self.scaler.step(self.optimizer)

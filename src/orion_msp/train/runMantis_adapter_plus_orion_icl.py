@@ -209,6 +209,51 @@ def _extend_parser(parser):
         ),
     )
 
+    parser.add_argument(
+        "--perm_consistency",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Enable permutation-consistency training across multiple support label codings.",
+    )
+    parser.add_argument(
+        "--perm_num_offsets",
+        type=int,
+        default=2,
+        help="Number of support-label offsets per episode when permutation-consistency is enabled.",
+    )
+    parser.add_argument(
+        "--perm_offsets_mode",
+        type=str,
+        default="cyclic",
+        choices=["cyclic", "random_unique"],
+        help="How to sample additional support-label offsets for permutation-consistency.",
+    )
+    parser.add_argument(
+        "--perm_consistency_weight",
+        type=float,
+        default=0.1,
+        help="Weight for the permutation-consistency loss term.",
+    )
+    parser.add_argument(
+        "--perm_consistency_loss",
+        type=str,
+        default="mse_prob",
+        choices=["mse_prob", "kl_prob", "cosine_logit"],
+        help="Loss used to align inverse-mapped logits across support-label offsets.",
+    )
+    parser.add_argument(
+        "--perm_consistency_detach_ref",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Detach the reference branch when computing permutation-consistency loss.",
+    )
+    parser.add_argument(
+        "--perm_consistency_only_on_active_classes",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Compute permutation-consistency on active classes only.",
+    )
+
     # ICL defaults from model.json -> orion.icl_predictor.config
     parser.set_defaults(
         embed_dim=128,
@@ -224,6 +269,251 @@ def _extend_parser(parser):
     return parser
 
 
+
+def cyclic_shift_labels(y_train: Tensor, active_classes: Tensor, offset: int) -> Tensor:
+    """Cyclically shift support labels inside the active-class set only."""
+    active_classes = active_classes.reshape(-1).long().to(y_train.device)
+    K = int(active_classes.numel())
+    if K <= 1:
+        return y_train.long().clone()
+
+    offset = int(offset) % K
+    if offset == 0:
+        return y_train.long().clone()
+
+    shifted = y_train.long().clone()
+    dst = torch.roll(active_classes, shifts=-offset, dims=0)
+    base = y_train.long()
+    for src_label, dst_label in zip(active_classes.unbind(0), dst.unbind(0)):
+        shifted[base == src_label] = dst_label
+    return shifted
+
+
+def inverse_shift_logits(logits: Tensor, active_classes: Tensor, offset: int, num_classes_total: int) -> Tensor:
+    """Inverse-map logits from shifted label coding back to the original class semantics."""
+    if logits.ndim not in {2, 3}:
+        raise ValueError(f"Expected logits to be 2D or 3D, got {tuple(logits.shape)}")
+    if int(logits.shape[-1]) != int(num_classes_total):
+        raise ValueError(
+            f"num_classes_total={num_classes_total} must match logits.shape[-1]={int(logits.shape[-1])}"
+        )
+
+    active_classes = active_classes.reshape(-1).long().to(logits.device)
+    K = int(active_classes.numel())
+    if K <= 1:
+        return logits.clone()
+
+    offset = int(offset) % K
+    if offset == 0:
+        return logits.clone()
+
+    restored = logits.clone()
+    shifted_cols = torch.roll(active_classes, shifts=-offset, dims=0)
+    restored[..., active_classes] = logits.index_select(dim=-1, index=shifted_cols)
+    return restored
+
+
+def slice_active_logits_and_remap_targets(logits: Tensor, y_true: Tensor, active_idx: Tensor) -> tuple[Tensor, Tensor]:
+    """Slice logits to active classes and remap targets into [0, K-1]."""
+    if logits.ndim < 2:
+        raise ValueError(f"Expected logits with class dim, got {tuple(logits.shape)}")
+
+    C = int(logits.shape[-1])
+    logits_flat = logits.reshape(-1, C)
+    true_flat = y_true.reshape(-1).long().to(logits.device)
+
+    valid = (true_flat >= 0) & (true_flat < C)
+    if not torch.all(valid):
+        logits_flat = logits_flat[valid]
+        true_flat = true_flat[valid]
+    if true_flat.numel() == 0:
+        return logits_flat[:0], true_flat[:0]
+
+    active_idx = active_idx.reshape(-1).long().to(logits.device)
+    active_idx = active_idx[(active_idx >= 0) & (active_idx < C)]
+    if active_idx.numel() == 0:
+        raise ValueError(f"Empty active classes after filtering to [0, {C})")
+
+    logits_active = logits_flat.index_select(dim=-1, index=active_idx)
+    K = int(active_idx.numel())
+    contiguous = torch.equal(active_idx, torch.arange(K, device=active_idx.device))
+    if contiguous:
+        true_active = true_flat
+    else:
+        mapper = torch.full((C,), -1, dtype=torch.long, device=active_idx.device)
+        mapper[active_idx] = torch.arange(K, device=active_idx.device)
+        true_active = mapper[true_flat]
+        if not torch.all(true_active >= 0):
+            missing_labels = torch.unique(true_flat[true_active < 0]).detach().cpu().tolist()
+            active_labels = active_idx.detach().cpu().tolist()
+            raise ValueError(
+                "Query labels not present in context active classes. "
+                f"missing_labels={missing_labels}, active_idx={active_labels}"
+            )
+
+    return logits_active, true_active
+
+
+def _select_permutation_offsets(active_classes: Tensor, *, num_offsets: int, mode: str) -> list[int]:
+    """Build unique offsets, always keeping offset 0 as the reference branch."""
+    K = int(active_classes.numel())
+    if K <= 1:
+        return [0]
+
+    num_offsets = min(max(1, int(num_offsets)), K)
+    if num_offsets == 1:
+        return [0]
+    if mode == "cyclic":
+        return list(range(num_offsets))
+    if mode != "random_unique":
+        raise ValueError(f"Unsupported perm_offsets_mode: {mode}")
+
+    candidates = torch.arange(1, K, device=active_classes.device)
+    order = torch.randperm(int(candidates.numel()), device=active_classes.device)
+    extra = candidates.index_select(0, order)[: num_offsets - 1].detach().cpu().tolist()
+    return [0] + [int(v) for v in extra]
+
+
+def _slice_logits_for_consistency(logits: Tensor, active_idx: Tensor, only_on_active_classes: bool) -> Tensor:
+    C = int(logits.shape[-1])
+    logits_flat = logits.reshape(-1, C)
+    if not only_on_active_classes:
+        return logits_flat
+
+    active_idx = active_idx.reshape(-1).long().to(logits.device)
+    active_idx = active_idx[(active_idx >= 0) & (active_idx < C)]
+    if active_idx.numel() == 0:
+        return logits_flat[:, :0]
+    return logits_flat.index_select(dim=-1, index=active_idx)
+
+
+def _permutation_consistency_loss(
+    aligned_logits_list: list[Tensor],
+    *,
+    active_idx: Tensor,
+    loss_name: str,
+    detach_ref: bool,
+    only_on_active_classes: bool,
+) -> Tensor:
+    """Anchor permutation-consistency on offset 0 and compare all other offsets to it."""
+    if len(aligned_logits_list) <= 1:
+        return aligned_logits_list[0].new_zeros((), dtype=torch.float32)
+
+    ref = _slice_logits_for_consistency(aligned_logits_list[0], active_idx, only_on_active_classes)
+    if ref.numel() == 0:
+        return ref.new_zeros((), dtype=torch.float32)
+
+    losses: list[Tensor] = []
+    for logits_other in aligned_logits_list[1:]:
+        other = _slice_logits_for_consistency(logits_other, active_idx, only_on_active_classes)
+        if other.shape != ref.shape:
+            raise ValueError(f"Consistency logits shape mismatch: ref={tuple(ref.shape)} other={tuple(other.shape)}")
+
+        ref_cmp = ref.detach() if detach_ref else ref
+        if loss_name == "mse_prob":
+            losses.append(F.mse_loss(F.softmax(other, dim=-1), F.softmax(ref_cmp, dim=-1)))
+        elif loss_name == "kl_prob":
+            if detach_ref:
+                target = F.softmax(ref.detach(), dim=-1)
+                losses.append(F.kl_div(F.log_softmax(other, dim=-1), target, reduction="batchmean"))
+            else:
+                log_other = F.log_softmax(other, dim=-1)
+                prob_ref = F.softmax(ref, dim=-1)
+                log_ref = F.log_softmax(ref, dim=-1)
+                prob_other = F.softmax(other, dim=-1)
+                kl_or = F.kl_div(log_other, prob_ref, reduction="batchmean")
+                kl_ro = F.kl_div(log_ref, prob_other, reduction="batchmean")
+                losses.append(0.5 * (kl_or + kl_ro))
+        elif loss_name == "cosine_logit":
+            cosine = F.cosine_similarity(other, ref_cmp, dim=-1)
+            losses.append(1.0 - cosine.mean())
+        else:
+            raise ValueError(f"Unsupported perm_consistency_loss: {loss_name}")
+
+    return torch.stack(losses).mean() if losses else ref.new_zeros((), dtype=torch.float32)
+
+
+def forward_with_permutation_consistency(model, x_i: Tensor, y_i: Tensor, train_size: int, config) -> tuple[Tensor, Tensor, Tensor, dict]:
+    """Episode-level forward for CE plus permutation-consistency training."""
+    y_train = y_i[:, :train_size].long()
+    y_test = y_i[:, train_size:].long()
+    zero = x_i.new_zeros((), dtype=torch.float32)
+    metrics = {
+        "num_active_classes": 0.0,
+        "perm_num_offsets": 0.0,
+        "ce_acc_single": 0.0,
+        "pc_loss_value": 0.0,
+        "num_query_targets": 0.0,
+    }
+
+    if y_test.numel() == 0:
+        return zero, zero, zero, metrics
+
+    active_idx = torch.unique(y_train).sort().values.long()
+    metrics["num_active_classes"] = float(active_idx.numel())
+    offsets = _select_permutation_offsets(
+        active_idx,
+        num_offsets=int(getattr(config, "perm_num_offsets", 2)),
+        mode=str(getattr(config, "perm_offsets_mode", "cyclic")),
+    )
+    metrics["perm_num_offsets"] = float(len(offsets))
+
+    aligned_logits_list: list[Tensor] = []
+    for offset in offsets:
+        y_train_shifted = cyclic_shift_labels(y_train, active_idx, offset)
+        logits = model(x_i, y_train_shifted, None)
+        aligned_logits = inverse_shift_logits(logits, active_idx, offset, int(logits.shape[-1]))
+        aligned_logits_list.append(aligned_logits)
+
+    ce_logits, true_active = slice_active_logits_and_remap_targets(aligned_logits_list[0], y_test, active_idx)
+    metrics["num_query_targets"] = float(true_active.numel())
+    if true_active.numel() == 0:
+        return zero, zero, zero, metrics
+
+    ce_loss = F.cross_entropy(ce_logits, true_active)
+    with torch.no_grad():
+        metrics["ce_acc_single"] = float((ce_logits.argmax(dim=-1) == true_active).float().mean().item())
+
+    pc_loss = zero
+    if int(active_idx.numel()) >= 2 and len(aligned_logits_list) >= 2:
+        pc_loss = _permutation_consistency_loss(
+            aligned_logits_list,
+            active_idx=active_idx,
+            loss_name=str(getattr(config, "perm_consistency_loss", "mse_prob")),
+            detach_ref=bool(getattr(config, "perm_consistency_detach_ref", True)),
+            only_on_active_classes=bool(getattr(config, "perm_consistency_only_on_active_classes", True)),
+        )
+    metrics["pc_loss_value"] = float(pc_loss.detach().item())
+
+    total_loss = ce_loss + float(getattr(config, "perm_consistency_weight", 0.1)) * pc_loss
+    return ce_loss, pc_loss, total_loss, metrics
+
+
+def _debug_assert_permutation_ops() -> None:
+    """Small self-check for shift/inverse logic on non-contiguous active labels."""
+    active = torch.tensor([2, 5, 7], dtype=torch.long)
+    labels = torch.tensor([[2, 5, 7, 9], [7, 5, 2, 9]], dtype=torch.long)
+    shifted = cyclic_shift_labels(labels, active, 1)
+    expected_shifted = torch.tensor([[5, 7, 2, 9], [2, 7, 5, 9]], dtype=torch.long)
+    assert torch.equal(shifted, expected_shifted), "cyclic_shift_labels failed on non-contiguous labels"
+
+    base_logits = torch.arange(22, dtype=torch.float32).reshape(2, 11)
+    shifted_logits = base_logits.clone()
+    shifted_cols = torch.roll(active, shifts=-1, dims=0)
+    shifted_logits[..., active] = base_logits.index_select(dim=-1, index=shifted_cols)
+    restored = inverse_shift_logits(shifted_logits, active, 1, 11)
+    assert torch.equal(restored, base_logits), "inverse_shift_logits failed to restore original semantics"
+    assert torch.equal(inverse_shift_logits(base_logits, active, 0, 11), base_logits), "offset=0 must be identity"
+
+    logits_active, true_active = slice_active_logits_and_remap_targets(
+        base_logits,
+        torch.tensor([2, 7], dtype=torch.long),
+        active,
+    )
+    assert logits_active.shape == (2, 3), "active class slicing returned wrong shape"
+    assert torch.equal(true_active, torch.tensor([0, 2], dtype=torch.long)), "target remapping failed"
+
+
 class Trainer(_BaseTrainer):
     """Trainer that swaps the backbone with end-to-end `_MantisAdapterPlusOrionICL`.
 
@@ -232,6 +522,7 @@ class Trainer(_BaseTrainer):
 
     def __init__(self, config):
         self._did_shape_assert = False
+        _debug_assert_permutation_ops()
         super().__init__(config)
         self._configure_mantis_eval()
         self._configure_ref_eval()
@@ -904,7 +1195,6 @@ class Trainer(_BaseTrainer):
 
         num_micro_batches = len(valid_micros)
         if num_micro_batches == 0:
-            self.scheduler.step()
             return {
                 "ce": 0.0,
                 "accuracy": 0.0,
@@ -961,7 +1251,6 @@ class Trainer(_BaseTrainer):
                     print(f"[overfit] Non-finite grad norm at step {self.curr_step}; skipping optimizer step.")
                 self.optimizer.zero_grad(set_to_none=True)
                 self.scaler.update()
-                self.scheduler.step()
                 results.update(
                     {
                         "grad_norm": float(total_gn),
@@ -1321,86 +1610,98 @@ class Trainer(_BaseTrainer):
         y_train = micro_y[:, :train_size].long()
         y_test = micro_y[:, train_size:].long()
 
+        def _zero_results() -> dict[str, float]:
+            return {
+                "ce": 0.0,
+                "accuracy": 0.0,
+                "train/ce_loss": 0.0,
+                "train/pc_loss": 0.0,
+                "train/num_offsets": 0.0,
+                "train/active_classes_mean": 0.0,
+            }
+
         if y_test.numel() == 0:
-            return {"ce": 0.0, "accuracy": 0.0}
+            return _zero_results()
 
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
         with self.amp_ctx:
-            logits = self.model(micro_X, y_train, None)  # (B, Ttest, C)
-            B, Ttest, C = logits.shape
+            if not bool(getattr(self.config, "perm_consistency", False)):
+                logits = self.model(micro_X, y_train, None)  # (B, Ttest, C)
+                _, _, C = logits.shape
 
-            # Flatten + valid-filter (must match accuracy branch semantics).
-            logits_acc = logits.reshape(-1, C)
-            true_acc = y_test.reshape(-1).long()
-            valid = (true_acc >= 0) & (true_acc < C)
-            if not torch.all(valid):
-                logits_acc = logits_acc[valid]
-                true_acc = true_acc[valid]
-            if true_acc.numel() == 0:
-                return {"ce": 0.0, "accuracy": 0.0}
-
-            # Active classes come from the context (y_train).
-            active_idx = torch.unique(y_train).sort().values.long()
-            active_idx = active_idx[(active_idx >= 0) & (active_idx < C)]
-            K = int(active_idx.numel())
-            if K == 0:
-                raise ValueError(
-                    f"Empty active classes (K=0) after filtering to [0, C). "
-                    f"C={C}, step={int(self.curr_step) + 1}, train_size={train_size}."
-                )
-
-            logits_active = logits_acc.index_select(dim=-1, index=active_idx)
-            if active_idx.min().item() == 0 and active_idx.max().item() == K - 1:
-                true_active = true_acc
-            else:
-                mapper = torch.full((C,), -1, dtype=torch.long, device=active_idx.device)
-                mapper[active_idx] = torch.arange(K, device=active_idx.device)
-                true_active = mapper[true_acc]
-
-                # Default behavior (方案A): fail fast if any query label is missing in context.
-                if not torch.all(true_active >= 0):
-                    missing_labels = torch.unique(true_acc[true_active < 0]).detach().cpu().tolist()
-                    active_labels = active_idx.detach().cpu().tolist()
-                    step_idx = int(self.curr_step) + 1
-                    if self.master_process:
-                        print(
-                            "[active-loss] Found query labels not in active_idx; episode may be malformed. "
-                            f"step={step_idx} train_size={train_size} C={C} K={K}",
-                            flush=True,
-                        )
-                        print(f"  active_idx: {active_labels}", flush=True)
-                        print(f"  missing_labels: {missing_labels}", flush=True)
-                        try:
-                            diff = sorted(set(missing_labels) - set(active_labels))
-                            print(f"  missing_labels \\ active_idx: {diff}", flush=True)
-                        except Exception:
-                            pass
+                active_idx = torch.unique(y_train).sort().values.long()
+                active_idx = active_idx[(active_idx >= 0) & (active_idx < C)]
+                K = int(active_idx.numel())
+                if K == 0:
                     raise ValueError(
-                        "Query labels not present in context active classes. "
-                        f"missing_labels={missing_labels}, active_idx={active_labels}, "
-                        f"step={step_idx}, train_size={train_size}"
+                        f"Empty active classes (K=0) after filtering to [0, C). "
+                        f"C={C}, step={int(self.curr_step) + 1}, train_size={train_size}."
                     )
 
-            # Debug log (DDP-safe): gate prints to master + periodic steps.
-            debug_every = int(getattr(self.config, "debug_active_loss_every", 100))
-            step_idx = int(self.curr_step) + 1
-            if self.master_process and debug_every > 0 and (step_idx % debug_every == 0):
-                ta_min = int(true_active.min().item()) if true_active.numel() else None
-                ta_max = int(true_active.max().item()) if true_active.numel() else None
-                active_list = active_idx.detach().cpu().tolist()
-                if len(active_list) > 64:
-                    active_list = active_list[:64] + ["..."]
-                print(
-                    "[active-loss] "
-                    f"step={step_idx} K={K} active_idx={active_list} "
-                    f"logits_active={tuple(logits_active.shape)} true_active_min/max={ta_min}/{ta_max}",
-                    flush=True,
-                )
+                logits_active, true_active = slice_active_logits_and_remap_targets(logits, y_test, active_idx)
+                if true_active.numel() == 0:
+                    return _zero_results()
 
-            # Loss aligned to active classes (context K classes).
-            loss = F.cross_entropy(logits_active, true_active)
+                debug_every = int(getattr(self.config, "debug_active_loss_every", 100))
+                step_idx = int(self.curr_step) + 1
+                if self.master_process and debug_every > 0 and (step_idx % debug_every == 0):
+                    ta_min = int(true_active.min().item()) if true_active.numel() else None
+                    ta_max = int(true_active.max().item()) if true_active.numel() else None
+                    active_list = active_idx.detach().cpu().tolist()
+                    if len(active_list) > 64:
+                        active_list = active_list[:64] + ["..."]
+                    print(
+                        "[active-loss] "
+                        f"step={step_idx} K={K} active_idx={active_list} "
+                        f"logits_active={tuple(logits_active.shape)} true_active_min/max={ta_min}/{ta_max}",
+                        flush=True,
+                    )
+
+                loss = F.cross_entropy(logits_active, true_active)
+                ce_loss_value = loss
+                pc_loss_value = loss.new_zeros((), dtype=torch.float32)
+                acc_val = (logits_active.argmax(dim=1) == true_active).float().mean().item()
+                num_offsets_val = 1.0
+                active_classes_val = float(K)
+            else:
+                episode_total_losses: list[Tensor] = []
+                episode_ce_losses: list[Tensor] = []
+                episode_pc_losses: list[Tensor] = []
+                episode_accs: list[float] = []
+                episode_num_offsets: list[float] = []
+                episode_active_counts: list[float] = []
+
+                for epi in range(int(micro_X.shape[0])):
+                    x_i = micro_X[epi : epi + 1]
+                    y_i = micro_y[epi : epi + 1]
+                    ce_loss_i, pc_loss_i, total_loss_i, metrics_i = forward_with_permutation_consistency(
+                        self.model,
+                        x_i,
+                        y_i,
+                        train_size,
+                        self.config,
+                    )
+                    if float(metrics_i.get("num_query_targets", 0.0)) <= 0:
+                        continue
+
+                    episode_total_losses.append(total_loss_i)
+                    episode_ce_losses.append(ce_loss_i)
+                    episode_pc_losses.append(pc_loss_i)
+                    episode_accs.append(float(metrics_i.get("ce_acc_single", 0.0)))
+                    episode_num_offsets.append(float(metrics_i.get("perm_num_offsets", 1.0)))
+                    episode_active_counts.append(float(metrics_i.get("num_active_classes", 0.0)))
+
+                if not episode_total_losses:
+                    return _zero_results()
+
+                loss = torch.stack(episode_total_losses).mean()
+                ce_loss_value = torch.stack(episode_ce_losses).mean()
+                pc_loss_value = torch.stack(episode_pc_losses).mean()
+                acc_val = float(sum(episode_accs) / max(1, len(episode_accs)))
+                num_offsets_val = float(sum(episode_num_offsets) / max(1, len(episode_num_offsets)))
+                active_classes_val = float(sum(episode_active_counts) / max(1, len(episode_active_counts)))
 
         if not torch.isfinite(loss):
             raise FloatingPointError("non-finite loss")
@@ -1411,16 +1712,14 @@ class Trainer(_BaseTrainer):
         if micro_batch_idx == num_micro_batches - 1:
             self._debug_log_missing_grads()
 
-        # Accuracy: reuse the exact same active-class tensors as the loss.
         with torch.no_grad():
-            if logits_active.numel() > 0 and true_active.numel() > 0:
-                acc_val = (logits_active.argmax(dim=1) == true_active).float().mean().item()
-            else:
-                acc_val = 0.0
-
             micro_results = {
                 "ce": scaled_loss.item(),
                 "accuracy": acc_val / num_micro_batches,
+                "train/ce_loss": float(ce_loss_value.detach().item()) / num_micro_batches,
+                "train/pc_loss": float(pc_loss_value.detach().item()) / num_micro_batches,
+                "train/num_offsets": float(num_offsets_val) / num_micro_batches,
+                "train/active_classes_mean": float(active_classes_val) / num_micro_batches,
             }
         return micro_results
 
