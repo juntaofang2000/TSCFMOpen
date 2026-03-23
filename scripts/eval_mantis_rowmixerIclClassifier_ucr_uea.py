@@ -359,9 +359,9 @@ def _parse_args() -> argparse.Namespace:
         )
     )
 
-    p.add_argument("--ucr-path", type=str, required=True)
-    p.add_argument("--uea-path", type=str, required=True)
-    p.add_argument("--suite", type=str, default="all", choices=["ucr", "uea", "all"])
+    p.add_argument("--ucr-path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/")
+    p.add_argument("--uea-path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/")
+    p.add_argument("--suite", type=str, default="ucr", choices=["ucr", "uea", "all"])
     p.add_argument("--dataset", type=str, default=None, help="Evaluate a single dataset name")
 
     p.add_argument("--device", type=str, default="cuda:0")

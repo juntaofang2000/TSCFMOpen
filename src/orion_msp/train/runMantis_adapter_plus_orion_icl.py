@@ -500,7 +500,8 @@ def _debug_assert_permutation_ops() -> None:
     base_logits = torch.arange(22, dtype=torch.float32).reshape(2, 11)
     shifted_logits = base_logits.clone()
     shifted_cols = torch.roll(active, shifts=-1, dims=0)
-    shifted_logits[..., active] = base_logits.index_select(dim=-1, index=shifted_cols)
+    shifted_logits[..., shifted_cols] = base_logits.index_select(dim=-1, index=active)
+
     restored = inverse_shift_logits(shifted_logits, active, 1, 11)
     assert torch.equal(restored, base_logits), "inverse_shift_logits failed to restore original semantics"
     assert torch.equal(inverse_shift_logits(base_logits, active, 0, 11), base_logits), "offset=0 must be identity"
@@ -1375,6 +1376,18 @@ class Trainer(_BaseTrainer):
 
             self.curr_step += 1
 
+            # Keep checkpoint behavior aligned with the normal training loop.
+            if self.master_process:
+                save_temp_every = int(getattr(self.config, "save_temp_every", 0))
+                save_perm_every = int(getattr(self.config, "save_perm_every", 0))
+                should_save_temp = save_temp_every > 0 and (self.curr_step % save_temp_every == 0)
+                should_save_perm = save_perm_every > 0 and (self.curr_step % save_perm_every == 0)
+                if should_save_temp or should_save_perm:
+                    self.save_checkpoint(f"step-{self.curr_step}.ckpt")
+                    if should_save_temp and not should_save_perm:
+                        if int(getattr(self.config, "max_checkpoints", 0)) > 0:
+                            self.manage_checkpoint()
+
         # Summary + diagnosis
         mean_ce = float(sum(last_ce) / max(1, len(last_ce)))
         mean_acc = float(sum(last_acc) / max(1, len(last_acc)))
@@ -1395,7 +1408,7 @@ class Trainer(_BaseTrainer):
                 print("  - optimizer.step not happening / scaler skipping steps", flush=True)
                 print("  - grads are ~0 (frozen params, detached loss, wrong requires_grad)", flush=True)
                 print("  - loss not connected to logits (masking/indexing bug)", flush=True)
-                print("  - episode construction prevents learning (query labels mismatch / context leakage issues)", flush=True)
+                print("  - epis de construction prevents learning (query labels mismatch / context leakage issues)", flush=True)
                 print(
                     f"  - observed: mean_grad_norm={mean_gn:.3e}, last_param_delta_samples={last_delta[-5:] if last_delta else []}",
                     flush=True,
@@ -1411,17 +1424,17 @@ class Trainer(_BaseTrainer):
 
     def build_model(self):
         prior_type = str(getattr(self.config, "prior_type", ""))
-        if prior_type not in {"mlp_scm", "tree_scm", "mix_scm", "cauker_icl"}:
+        if prior_type not in {"mlp_scm", "tree_scm", "mix_scm", "cauker_icl", "ucr_uea_icl"}:
             raise ValueError(
                 f"This trainer is intended for SCM synthetic data; got prior_type={prior_type!r}. "
-                "Use --prior_type mlp_scm|tree_scm|mix_scm|cauker_icl."
+                "Use --prior_type mlp_scm|tree_scm|mix_scm|cauker_icl|ucr_uea_icl."
             )
 
         model_max_classes = int(getattr(self.config, "model_max_classes", 10))
         prior_max_classes = int(getattr(self.config, "max_classes", model_max_classes))
         if model_max_classes < 1:
             raise ValueError(f"model_max_classes must be >= 1, got {model_max_classes}")
-        if prior_type == "cauker_icl":
+        if prior_type in {"cauker_icl", "ucr_uea_icl"}:
             eff_prior_upper = int(min(prior_max_classes, int(getattr(self.config, "icl_k", prior_max_classes))))
         else:
             eff_prior_upper = prior_max_classes
@@ -1777,3 +1790,4 @@ if __name__ == "__main__":
     if bool(getattr(cfg, "overfit_one_episode", False)):
         trainer.train_overfit_one_episode()
     trainer.train()
+

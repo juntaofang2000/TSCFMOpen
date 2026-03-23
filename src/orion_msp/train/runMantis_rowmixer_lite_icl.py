@@ -339,6 +339,14 @@ class Trainer(_SharedTrainer):
         ckpt_obj = torch.load(ckpt_path, map_location="cpu")
         model_cfg = ckpt_obj.get("config") if isinstance(ckpt_obj, dict) else None
 
+        # Some reference checkpoints are stored as split dicts:
+        # {mantis_state_dict, rowmixer_state_dict, ...} instead of a flat state_dict.
+        split_ckpt = (
+            isinstance(ckpt_obj, dict)
+            and isinstance(ckpt_obj.get("mantis_state_dict"), dict)
+            and isinstance(ckpt_obj.get("rowmixer_state_dict"), dict)
+        )
+
         if isinstance(model_cfg, dict) and "rowmixer_icl" in model_cfg and "mantis" in model_cfg:
             mantis_cfg = dict(model_cfg.get("mantis", {}))
             row_cfg = dict(model_cfg.get("rowmixer_icl", {}))
@@ -431,11 +439,35 @@ class Trainer(_SharedTrainer):
                 mantis_batch_size=mantis_batch_size,
             ).to(self.config.device)
 
-        if isinstance(ckpt_obj, dict):
-            state_dict = ckpt_obj.get("state_dict") or ckpt_obj.get("model_state_dict") or ckpt_obj.get("model") or ckpt_obj
+        if split_ckpt:
+            # Load split state dicts directly into submodules.
+            mantis_sd = self._clean_state_dict(ckpt_obj.get("mantis_state_dict", {}))
+            rowmixer_sd = self._clean_state_dict(ckpt_obj.get("rowmixer_state_dict", {}))
+
+            mantis_incompat = ref_model.mantis_model.load_state_dict(mantis_sd, strict=False)
+            row_incompat = ref_model.rowmixer_icl.load_state_dict(rowmixer_sd, strict=False)
+
+            if self.master_process:
+                print(f"[ref_eval] loaded split checkpoint format: {ckpt_path}")
+                print(f"[ref_eval] mantis loaded={len(mantis_sd)} missing={len(getattr(mantis_incompat, 'missing_keys', []))} unexpected={len(getattr(mantis_incompat, 'unexpected_keys', []))}")
+                print(f"[ref_eval] rowmixer loaded={len(rowmixer_sd)} missing={len(getattr(row_incompat, 'missing_keys', []))} unexpected={len(getattr(row_incompat, 'unexpected_keys', []))}")
         else:
-            state_dict = ckpt_obj
-        ref_model.load_state_dict(self._clean_state_dict(state_dict), strict=False)
+            if isinstance(ckpt_obj, dict):
+                state_dict = ckpt_obj.get("state_dict") or ckpt_obj.get("model_state_dict") or ckpt_obj.get("model") or ckpt_obj
+            else:
+                state_dict = ckpt_obj
+
+            cleaned = self._clean_state_dict(state_dict)
+            model_keys = set(ref_model.state_dict().keys())
+            ckpt_keys = set(cleaned.keys())
+            matched = len(model_keys & ckpt_keys)
+            incompat = ref_model.load_state_dict(cleaned, strict=False)
+
+            if self.master_process:
+                ratio = (matched / max(1, len(model_keys)))
+                print(f"[ref_eval] key match ratio={matched}/{len(model_keys)} ({ratio:.3f})")
+                print(f"[ref_eval] missing={len(getattr(incompat, 'missing_keys', []))} unexpected={len(getattr(incompat, 'unexpected_keys', []))}")
+
         ref_model.eval()
         self.ref_eval_model = ref_model
 

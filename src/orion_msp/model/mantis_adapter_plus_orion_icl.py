@@ -50,8 +50,17 @@ class _MantisAdapterPlusOrionICL(nn.Module):
         return torch.cat([X, pad], dim=-1)
 
     def _encode_rows(self, X: Tensor) -> Tensor:
+        if X.ndim == 4:
+            if int(X.shape[2]) != 1:
+                raise ValueError(
+                    f"Expected single-channel X when 4D, got {tuple(X.shape)}. "
+                    "For multichannel UCR/UEA data, either force one channel in the prior "
+                    "or use a model path with explicit multichannel support."
+                )
+            X = X.squeeze(2)
+
         if X.ndim != 3:
-            raise ValueError(f"Expected X to be (B,T,H), got {tuple(X.shape)}")
+            raise ValueError(f"Expected X to be (B,T,H) or (B,T,1,H), got {tuple(X.shape)}")
 
         X = self._pad_or_truncate(X)
         B, T, L = X.shape
@@ -73,3 +82,4 @@ class _MantisAdapterPlusOrionICL(nn.Module):
         reps = self.adapter(reps)
         # ICLearning (or compatible) returns (B, T_test, C)
         return self.icl_predictor(reps, y_train=y_train, return_logits=True)
+
